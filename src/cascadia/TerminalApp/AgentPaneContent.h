@@ -111,6 +111,7 @@ namespace winrt::TerminalApp::implementation
             _agentRestoreIdentity = source._agentRestoreIdentity;
             _agentRestoreCustomCommand = source._agentRestoreCustomCommand;
             _wtaExecutablePath = source._wtaExecutablePath;
+            _usesCustomCommand = source._usesCustomCommand;
         }
 
         void CopyLiveStateFrom(const AgentPaneContent& source)
@@ -187,6 +188,9 @@ namespace winrt::TerminalApp::implementation
         // subscribes to WT events before it can publish that status, so this
         // also proves that settings events can reach the helper.
         bool IsHelperEventReady() const noexcept { return _helperEventReady; }
+        // True when the pane runs the Agent Pane profile's command line instead of wta.
+        bool UsesCustomCommand() const noexcept { return _usesCustomCommand; }
+        void UsesCustomCommand(const bool value) noexcept { _usesCustomCommand = value; }
         winrt::hstring GetAgentName() const noexcept { return _agentName; }
         winrt::hstring GetAgentModel() const noexcept { return _agentModel; }
         winrt::hstring GetLastErrorPaneId() const noexcept { return _lastErrorPaneId; }
@@ -238,6 +242,7 @@ namespace winrt::TerminalApp::implementation
         winrt::hstring _agentState{};
         winrt::hstring _agentBackend{};
         bool _helperEventReady{ false };
+        bool _usesCustomCommand{ false };
 
         // When true, the bar replaces the agent/model label with "Agent sessions"
         // and hides the agent logo. Driven by TerminalPage::OnAgentStateChanged

@@ -1359,6 +1359,29 @@ namespace winrt::TerminalApp::implementation
         return winrt::hstring{};
     }
 
+    // Returns the command line set on the Agent Pane profile, or empty if it isn't set.
+    winrt::hstring TerminalPage::_CustomAgentPaneCommandline() const
+    {
+        const auto profileId = _settings.GlobalSettings().AiCoordinatorProfile();
+        if (!std::wstring_view{ profileId }.starts_with(L'{'))
+        {
+            return {};
+        }
+        try
+        {
+            const auto profileGuid = winrt::guid{ ::Microsoft::Console::Utils::GuidFromString(profileId.c_str()) };
+            if (const auto profile = _settings.FindProfile(profileGuid))
+            {
+                if (profile.HasCommandline())
+                {
+                    return profile.Commandline();
+                }
+            }
+        }
+        CATCH_LOG();
+        return {};
+    }
+
     // Look up a foreground or kept tab by its StableId. Returns
     // nullptr if no tab has that id.
     winrt::com_ptr<Tab> TerminalPage::_FindTabByStableId(const winrt::hstring& stableId) const
@@ -4367,6 +4390,14 @@ namespace winrt::TerminalApp::implementation
             return false;
         }
 
+        // If the Agent Pane profile has its own command line, run that instead of wta.
+        // Start it when the pane is opened, don't pre-warm it in every tab.
+        const auto customAgentPaneCommandline = _CustomAgentPaneCommandline();
+        if (!customAgentPaneCommandline.empty() && autoStash)
+        {
+            return false;
+        }
+
         const auto& globals = _settings.GlobalSettings();
         const auto sourceProfile = _ResolveAgentSourceProfile(tab, _settings);
         if (sourceProfile)
@@ -4752,7 +4783,14 @@ namespace winrt::TerminalApp::implementation
         }
 
         NewTerminalArgs args;
-        args.Commandline(winrt::hstring{ helperCmd });
+        if (customAgentPaneCommandline.empty())
+        {
+            args.Commandline(winrt::hstring{ helperCmd });
+        }
+        else
+        {
+            args.Commandline(customAgentPaneCommandline);
+        }
         args.Profile(globals.AiCoordinatorProfile());
         if (!resolvedWorkingDirectories.helper.empty())
         {
@@ -4781,6 +4819,7 @@ namespace winrt::TerminalApp::implementation
         const auto core = _manager.TryLookupCore(newPane->GetTerminalControl().ContentId());
         THROW_HR_IF(E_UNEXPECTED, !core);
         winrt::get_self<implementation::AgentPaneContent>(ownedContent)->AdoptLifetime(AgentPaneLifetime{ std::move(lease), core });
+        winrt::get_self<implementation::AgentPaneContent>(ownedContent)->UsesCustomCommand(!customAgentPaneCommandline.empty());
         newPane->IsAgentPane(true);
         // A restore supplies the side the pane was actually on, which can
         // differ from the configured default after a splitter drag or a
@@ -17154,6 +17193,14 @@ namespace winrt::TerminalApp::implementation
                 if (sourcePane)
                 {
                     pasteTargetsAgentPane = sourcePane->IsAgentPane();
+                    if (pasteTargetsAgentPane)
+                    {
+                        // Panes running a custom command get a normal paste.
+                        if (const auto agentContent = sourcePane->GetContent().try_as<winrt::TerminalApp::AgentPaneContent>())
+                        {
+                            pasteTargetsAgentPane = !winrt::get_self<implementation::AgentPaneContent>(agentContent)->UsesCustomCommand();
+                        }
+                    }
                     if (pasteTargetsAgentPane)
                     {
                         agentPasteTabId = tab->StableId();

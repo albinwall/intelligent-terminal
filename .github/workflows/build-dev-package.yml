@@ -1,0 +1,76 @@
+# Builds an unsigned x64 Dev package. Install it with tools/Install-DevPackage.ps1.
+name: Build Dev package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude-agent-pane]
+    paths-ignore:
+      - '**.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-dev-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: x64 Release Dev package
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Run from the repo root so the root .cargo/config.toml is used.
+      - name: Build wta
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --manifest-path tools/wta/Cargo.toml --target x86_64-pc-windows-msvc --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+
+      - name: Generate NOTICE.html
+        run: |
+          .\build\scripts\Generate-ThirdPartyNotices.ps1 -MarkdownNoticePath .\NOTICE.md -OutputPath .\src\cascadia\CascadiaPackage\NOTICE.html
+
+      - name: Build package
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          call tools\razzle.cmd
+          if errorlevel 1 exit /b 1
+          nuget restore OpenConsole.slnx -Verbosity quiet -NonInteractive
+          if errorlevel 1 exit /b 1
+          nuget restore dep\nuget\packages.config -Verbosity quiet -NonInteractive
+          if errorlevel 1 exit /b 1
+          "%MSBUILD%" OpenConsole.slnx /m /p:Configuration=Release /p:Platform=x64 /p:WindowsTerminalBranding=Dev /p:AppxPackageSigningEnabled=false /p:AppxBundle=Never /p:GenerateAppxPackageOnBuild=true /t:Terminal\CascadiaPackage /bl:msbuild.binlog
+          if errorlevel 1 exit /b 1
+
+      - name: List package files
+        run: |
+          Get-ChildItem -Recurse src\cascadia\CascadiaPackage\AppPackages -File |
+            ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.FullName }
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: intelligent-terminal-dev-x64
+          path: src/cascadia/CascadiaPackage/AppPackages/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: msbuild-binlog
+          path: msbuild.binlog
+          if-no-files-found: ignore
+          retention-days: 7
