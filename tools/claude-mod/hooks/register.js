@@ -118,9 +118,13 @@ async function wt($, args, stdin) {
 // ---------- the terminal ----------
 
 // Find the tab this session's pane is in. Cached for a few seconds.
+// Terminal leaves agent panes out of its pane lists, so an agent pane finds its
+// tab as the one holding the shell panes it knew, or at the start as the focused tab.
 async function findOwnTab($, fresh) {
   if (!selfPane) return null
   if (!fresh && ownTab && Date.now() - ownTab.at < 3000) return ownTab
+  const known = new Set((ownTab?.panes ?? []).map(p => norm(p.session_id)))
+  let byKnown = null
   const wins = await wt($, ['list-windows'])
   for (const w of wins.windows ?? []) {
     const tabs = await wt($, ['list-tabs', '-w', String(w.window_id)])
@@ -128,15 +132,29 @@ async function findOwnTab($, fresh) {
       if (!t.pane_count) continue
       const list = await wt($, ['list-panes', '-w', String(w.window_id), '-t', String(t.tab_id)])
       const panes = list.panes ?? []
-      const me = panes.find(p => norm(p.session_id) === selfPane)
-      if (me) {
-        ownTab = { at: Date.now(), windowId: w.window_id, tabIndex: t.tab_id, panes, isAgentPane: !!me.is_agent_pane }
+      if (panes.some(p => norm(p.session_id) === selfPane)) {
+        ownTab = { at: Date.now(), windowId: w.window_id, tabIndex: t.tab_id, panes, isAgentPane: false }
         return ownTab
+      }
+      if (!byKnown && panes.some(p => known.has(norm(p.session_id)))) {
+        byKnown = { at: Date.now(), windowId: w.window_id, tabIndex: t.tab_id, panes, isAgentPane: true }
       }
     }
   }
-  // A hidden agent pane isn't in any tab. Keep what we knew.
-  if (ownTab) ownTab.at = Date.now()
+  if (byKnown) {
+    ownTab = byKnown
+    return ownTab
+  }
+  if (!ownTab) {
+    // Not listed and nothing known yet: an agent pane that just opened in the focused tab.
+    const active = await wt($, ['active-pane'])
+    if (active.session_id && norm(active.session_id) !== selfPane) {
+      const list = await wt($, ['list-panes', '-w', String(active.window_id), '-t', String(active.tab_id)])
+      ownTab = { at: Date.now(), windowId: active.window_id, tabIndex: active.tab_id, panes: list.panes ?? [], isAgentPane: true }
+    }
+    return ownTab
+  }
+  ownTab.at = Date.now()
   return ownTab
 }
 
@@ -316,6 +334,8 @@ async function publishSelf($) {
       wtPane: selfPane,
       herdrPane,
       conductor,
+      tabPanes: (ownTab?.panes ?? []).map(p => norm(p.session_id)),
+      isAgentPane: !!ownTab?.isAgentPane,
       at: await $.clock.now(),
     })
   } catch {
@@ -684,8 +704,16 @@ export function register(on) {
     herdrPane = (await $.env.get('HERDR_ENV')) === '1' ? (await $.env.get('HERDR_PANE_ID')) ?? '' : ''
     // Inside a multiplexer the terminal pane belongs to the multiplexer, not to this session.
     selfPane = herdrPane || (await $.env.get('TMUX')) ? '' : norm(await $.env.get('WT_SESSION'))
+    // After a reload, start from what this session knew about its tab.
+    sessionId = await $.session.id()
+    let saved = null
+    try { saved = await $.store.get(FLEET + sessionId) } catch { saved = null }
+    if (selfPane && saved?.wtPane === selfPane && saved.tabPanes?.length) {
+      ownTab = { at: 0, windowId: 0, tabIndex: 0, panes: saved.tabPanes.map(id => ({ session_id: id })), isAgentPane: !!saved.isAgentPane }
+    }
     const tab = await findOwnTab($, true)
-    conductor = (await $.env.get('CLAUDE_TERMINAL_ROLE')) === 'conductor' || !!tab?.isAgentPane
+    const role = await $.env.get('CLAUDE_TERMINAL_ROLE')
+    conductor = role === 'conductor' || (role !== 'session' && !!tab?.isAgentPane)
     statusSince = await $.clock.now()
     await publishSelf($)
     $.clock.every(60000, () => publishSelf($))
