@@ -43,9 +43,9 @@ try {
 finally { $zip.Dispose() }
 
 # Install the framework packages the app needs, if they're missing.
-Get-ChildItem $download -Recurse -Filter '*.appx' | Where-Object { $_.DirectoryName -match '\\Dependencies\\x64' } | ForEach-Object {
-    try { Add-AppxPackage -Path $_.FullName -ErrorAction Stop; Write-Host "Installed $($_.Name)" }
-    catch { Write-Host "Skipped $($_.Name) (already installed)" }
+foreach ($dep in Get-ChildItem $download -Recurse -Filter '*.appx' | Where-Object { $_.DirectoryName -match '\\Dependencies\\x64' }) {
+    try { Add-AppxPackage -Path $dep.FullName -ErrorAction Stop; Write-Host "Installed $($dep.Name)" }
+    catch { Write-Host "Skipped $($dep.Name) (already installed)" }
 }
 
 [xml]$manifest = Get-Content (Join-Path $layout 'AppxManifest.xml')
