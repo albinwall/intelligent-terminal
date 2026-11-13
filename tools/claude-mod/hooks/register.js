@@ -1,10 +1,5 @@
-// Intelligent Terminal features for Claude Code.
-//
-// Two roles. The conductor (the session in the terminal's agent pane, or one started with
-// CLAUDE_TERMINAL_ROLE=conductor) gets the terminal: a note about the user's pane with each
-// prompt, tools for panes and sessions, the Fix line for failed commands, and the session
-// watcher. Every other session only shares its state (context, busy or idle, last reply)
-// and runs the handover and /compact the conductor asks for.
+// Intelligent Terminal features for Claude Code: tools for panes and sessions, a note about
+// the user's pane with each prompt, and a Fix line when a command fails in the same tab.
 // The terminal is reached through wtcli.exe, which ships with Intelligent Terminal.
 
 const WTCLI = 'wtcli.exe'
@@ -15,9 +10,9 @@ const CONTROL = '[terminal-control]'
 const RESULT = '[terminal-result]'
 const FRESH_MS = 3 * 60000
 
-const INTRO = `You are running inside Intelligent Terminal (Windows Terminal with agent support), most likely in the agent pane under the user's shell. The mcp__terminal__ tools let you see and use the terminal and the other Claude Code sessions:
-- panes lists windows, tabs and panes. read reads a pane's screen, or just its last command and output.
-- run types a command into one of the user's panes (they approve it first) and can wait for the result. keys sends key presses such as Escape, Enter or C-c.
+const INTRO = `You are running inside Intelligent Terminal (Windows Terminal with agent support). The mcp__terminal__ tools let you see and use the terminal and the other Claude Code sessions:
+- panes lists windows, tabs and panes, with the agent CLI running in each. read reads a pane's screen, or just its last command and output.
+- run types a command into one of the user's shell panes and can wait for the result. type types text into one or more panes and presses Enter, for example a slash command into every pane running Claude Code. keys sends key presses such as Escape, Enter or C-c.
 - open opens a new tab or split, with an optional command, folder or profile. delegate starts another Claude in a new tab or split with a task.
 - profiles lists terminal profiles. resolve_command shows what a command name resolves to for a folder and shell. focus and close act on a pane.
 - sessions lists every Claude Code session on this machine with busy or idle, idle time and context size. compact_session asks one to write its handover and run /compact. watch keeps an eye on all sessions and does that at good checkpoints. To talk to a session, use SendMessage.
@@ -37,9 +32,9 @@ const WATCH_DEFAULTS = { enabled: true, mode: 'ask', min_context_k: 400, min_idl
 
 let sessionId = ''
 let selfPane = ''
-let herdrPane = ''
-let conductor = false
 let home = ''
+let lastWtError = ''
+const exePaths = new Map()
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
 let tabStableId = ''
 let lastShellPane = ''
@@ -105,13 +100,57 @@ function unpack(marker, text) {
   try { return JSON.parse(decodeURIComponent(m[1])) } catch { return null }
 }
 
+// Programs started inside an app package (such as the agent pane) can't use the shared
+// app alias folder, only each app's own one, so look there when the plain name fails.
+async function exe($, name) {
+  if (exePaths.has(name)) return exePaths.get(name)
+  const candidates = [name]
+  const local = await $.env.get('LOCALAPPDATA')
+  if (local) {
+    const apps = `${local}\\Microsoft\\WindowsApps`
+    try {
+      for (const entry of await $.fs.list(apps)) {
+        if (entry.kind === 'file') continue
+        try {
+          const inner = await $.fs.list(`${apps}\\${entry.name}`)
+          if (inner.some(f => f.name.toLowerCase() === name.toLowerCase())) candidates.push(`${apps}\\${entry.name}\\${name}`)
+        } catch {
+          // An app folder we can't read.
+        }
+      }
+    } catch {
+      // No alias folder; the plain name is all there is.
+    }
+  }
+  for (const candidate of candidates) {
+    try {
+      const r = await $.process.run([candidate, '--help'], { timeoutMs: 5000 })
+      if (r.exitCode !== 0) {
+        lastWtError = `${candidate} --help: exit ${r.exitCode} ${(r.stderr || r.stdout).trim().slice(0, 200)}`
+        continue
+      }
+      exePaths.set(name, candidate)
+      return candidate
+    } catch (err) {
+      lastWtError = `${candidate}: ${String(err?.message ?? err).slice(0, 200)}`
+    }
+  }
+  exePaths.set(name, name)
+  return name
+}
+
 async function wt($, args, stdin) {
   try {
-    const r = await $.process.run([WTCLI, '--json', ...args], stdin ? { stdin, timeoutMs: 10000 } : { timeoutMs: 10000 })
-    if (r.exitCode !== 0) return { error: (r.stderr || r.stdout || 'wtcli failed').trim() }
+    const r = await $.process.run([await exe($, WTCLI), '--json', ...args], stdin ? { stdin, timeoutMs: 10000 } : { timeoutMs: 10000 })
+    if (r.exitCode !== 0) {
+      lastWtError = `${args[0]} (${exePaths.get(WTCLI)}): ${(r.stderr || r.stdout || 'wtcli failed').trim()}`
+      return { error: lastWtError }
+    }
+    lastWtError = ''
     try { return JSON.parse(r.stdout) } catch { return { text: r.stdout } }
   } catch (err) {
-    return { error: String(err?.message ?? err) }
+    lastWtError = `${args[0]}: ${String(err?.message ?? err)}`
+    return { error: lastWtError }
   }
 }
 
@@ -196,7 +235,7 @@ async function publishFixState($, params) {
   if (!ownTab?.isAgentPane || !tabStableId) return
   const evt = JSON.stringify({ type: 'event', method: 'autofix_state', params: { ...params, tab_id: tabStableId } })
   try {
-    await $.process.run([WTCLI, 'publish', '--existing-only', '--stdin'], { stdin: evt, timeoutMs: 5000 })
+    await $.process.run([await exe($, WTCLI), 'publish', '--existing-only', '--stdin'], { stdin: evt, timeoutMs: 5000 })
   } catch {
     // Terminal isn't there; nothing to update.
   }
@@ -291,7 +330,7 @@ async function listen($) {
   for (;;) {
     let buf = ''
     try {
-      const events = $.process.spawn({ argv: [WTCLI, '--json', 'listen', '--existing-only'] })
+      const events = $.process.spawn({ argv: [await exe($, WTCLI), '--json', 'listen', '--existing-only'] })
       for await (const chunk of events) {
         if (chunk.stream !== 'stdout') continue
         buf += chunk.text
@@ -318,7 +357,7 @@ async function findHome($) {
   return user ? `${user}/.claude` : ''
 }
 
-// This session's state, for the conductor.
+// This session's state, for the sessions tool in other sessions.
 async function publishSelf($) {
   try {
     sessionId = await $.session.id()
@@ -332,14 +371,13 @@ async function publishSelf($) {
       reply: lastReply,
       cwd: await $.session.cwd(),
       wtPane: selfPane,
-      herdrPane,
-      conductor,
       tabPanes: (ownTab?.panes ?? []).map(p => norm(p.session_id)),
       isAgentPane: !!ownTab?.isAgentPane,
+      wtError: lastWtError,
       at: await $.clock.now(),
     })
   } catch {
-    // The store is for the conductor; this session works without it.
+    // The store is for other sessions; this session works without it.
   }
 }
 
@@ -386,7 +424,7 @@ async function liveSessions($) {
 function sessionLine(s, me) {
   const ctx = s.rec?.k != null ? `${s.rec.k}k of ${s.rec.w}k` : 'context unknown'
   const state = s.status === 'idle' ? `idle ${s.idleMin} min` : s.status
-  const where = s.rec?.herdrPane ? `herdr pane ${s.rec.herdrPane}` : s.rec?.wtPane ? `terminal pane ${s.rec.wtPane}` : ''
+  const where = s.rec?.wtPane ? `terminal pane ${s.rec.wtPane}` : ''
   const mod = s.rec ? '' : ', no terminal mod'
   const last = s.rec?.reply ? `\n    last: ${clip(s.rec.reply.replace(/\s+/g, ' '), 200)}` : ''
   return `${s.name}${s.id === me ? ' (you)' : ''} [${s.id}]: ${state}, ${ctx}, ${s.cwd}${where ? ', ' + where : ''}${mod}${last}`
@@ -400,7 +438,7 @@ async function findSession($, query) {
 }
 
 async function askToCompact($, s, opts) {
-  if (!s.rec) return `${s.name} doesn't run the terminal mod, so it can't be asked. Type /compact into its input instead (the run or keys tool for a terminal pane, or herdr for a herdr pane).`
+  if (!s.rec) return `${s.name} doesn't run the terminal mod, so it can't be asked. Type /compact into its pane instead with the type tool.`
   const token = await controlToken($, true)
   const msg = { op: 'compact', token, from: sessionId, handover: opts.handover !== false, handoverPrompt: opts.handover_prompt || '', instructions: opts.instructions || COMPACT }
   const sent = await $.session.send({ to: { sessionId: s.id }, text: pack(CONTROL, msg) })
@@ -440,7 +478,7 @@ async function report($, to, text) {
     const token = await controlToken($, false)
     await $.session.send({ to: { sessionId: to }, text: pack(RESULT, { token, from: sessionId, text }) })
   } catch {
-    // The conductor sees the drop in context anyway.
+    // The sender sees the drop in context anyway.
   }
 }
 
@@ -527,7 +565,7 @@ async function toolPanes($) {
         out.push({
           window: w.window_id, tab: t.tab_id, tab_title: t.title, pane, title: p.title,
           shell: p.shell, cwd: p.cwd, profile: p.profile, active: !!p.is_active,
-          agent_pane: !!p.is_agent_pane, you: pane === selfPane,
+          agent: p.native_agent_provider_id || undefined, you: pane === selfPane,
           last_exit: lastExit.get(pane),
         })
       }
@@ -572,6 +610,24 @@ async function toolRun($, e) {
   return `Finished with exit code ${lastExit.get(pane)}.\n${clip(last.content ?? '', 6000)}`
 }
 
+async function toolType($, e) {
+  const panes = (Array.isArray(e.panes) ? e.panes : [e.panes]).map(norm).filter(p => p)
+  const text = String(e.text ?? '')
+  if (!panes.length || !text) return 'Give the panes and the text.'
+  const out = []
+  for (const pane of panes) {
+    if (pane === selfPane) { out.push(`${pane}: skipped, that's your own pane`); continue }
+    const sent = await wt($, ['send-keys', '-t', pane, '--raw', '--', text])
+    if (sent.error) { out.push(`${pane}: ${sent.error}`); continue }
+    if (e.enter !== false) {
+      const enter = await wt($, ['send-keys', '-t', pane, 'Enter'])
+      if (enter.error) { out.push(`${pane}: ${enter.error}`); continue }
+    }
+    out.push(`${pane}: sent`)
+  }
+  return out.join('\n')
+}
+
 async function toolKeys($, e) {
   const pane = norm(e.pane)
   if (!pane) return 'No pane given.'
@@ -613,7 +669,7 @@ async function toolResolve($, e) {
   if (e.cwd) args.push('--cwd', e.cwd)
   if (e.shell) args.push('--shell', e.shell)
   try {
-    const r = await $.process.run(['wta.exe', ...args], { timeoutMs: 20000 })
+    const r = await $.process.run([await exe($, 'wta.exe'), ...args], { timeoutMs: 20000 })
     return (r.stdout || r.stderr || '').trim() || `wta exited with ${r.exitCode}`
   } catch (err) {
     return String(err?.message ?? err)
@@ -653,6 +709,7 @@ async function runTool($, name, e) {
   if (name === 'read') return toolRead($, e)
   if (name === 'run') return toolRun($, e)
   if (name === 'keys') return toolKeys($, e)
+  if (name === 'type') return toolType($, e)
   if (name === 'open') return toolOpen($, e)
   if (name === 'delegate') return toolDelegate($, e)
   if (name === 'resolve_command') return toolResolve($, e)
@@ -677,7 +734,8 @@ async function registerTools($) {
   const pane = { type: 'string', description: 'Pane id from panes. Leave out to use the pane the user is working in.' }
   const direction = { type: 'string', enum: ['right', 'left', 'up', 'down', 'auto'] }
   const tools = [
-    { name: 'panes', description: 'List Windows Terminal windows, tabs and panes with shell, folder, title and last exit code. Your own pane is marked "you".', inputSchema: { type: 'object', properties: {} } },
+    { name: 'panes', description: 'List Windows Terminal windows, tabs and panes with shell, folder, title, last exit code and the agent CLI running in the pane (agent, for example "claude"). Your own pane is marked "you".', inputSchema: { type: 'object', properties: {} } },
+    { name: 'type', description: 'Type text into the input of one or more terminal panes, then press Enter, as if the user typed it. For example a slash command into every pane running Claude Code (find them with panes). A newline in the text also presses Enter.', inputSchema: { type: 'object', properties: { panes: { type: 'array', items: { type: 'string' }, description: 'Pane ids from panes.' }, text: { type: 'string' }, enter: { type: 'boolean', description: 'Press Enter after the text. Default true.' } }, required: ['panes', 'text'] } },
     { name: 'read', description: "Read a terminal pane's screen, or just its last command and output.", inputSchema: { type: 'object', properties: { pane, lines: { type: 'integer', description: 'How many lines, up to 400. Default 60.' }, last_command: { type: 'boolean', description: 'Only the last command and its output (needs shell integration).' } } } },
     { name: 'run', description: "Type a command into one of the user's terminal panes and press Enter. The user approves it first. By default waits a few seconds and returns the output.", inputSchema: { type: 'object', properties: { command: { type: 'string', description: "The command, in that pane's shell syntax." }, pane, wait: { type: 'boolean', description: 'Wait for the result. Default true.' } }, required: ['command'] } },
     { name: 'keys', description: 'Send key presses to a terminal pane, for example ["Escape"] to stop a Claude session, or ["/compact", "Enter"]. Names: Enter, Tab, Escape, BSpace, C-c and other C-<key>. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
@@ -701,9 +759,7 @@ async function registerTools($) {
 export function register(on) {
   on('session.start', async ($, e, next) => {
     home = await findHome($)
-    herdrPane = (await $.env.get('HERDR_ENV')) === '1' ? (await $.env.get('HERDR_PANE_ID')) ?? '' : ''
-    // Inside a multiplexer the terminal pane belongs to the multiplexer, not to this session.
-    selfPane = herdrPane || (await $.env.get('TMUX')) ? '' : norm(await $.env.get('WT_SESSION'))
+    selfPane = norm(await $.env.get('WT_SESSION'))
     // After a reload, start from what this session knew about its tab.
     sessionId = await $.session.id()
     let saved = null
@@ -711,13 +767,10 @@ export function register(on) {
     if (selfPane && saved?.wtPane === selfPane && saved.tabPanes?.length) {
       ownTab = { at: 0, windowId: 0, tabIndex: 0, panes: saved.tabPanes.map(id => ({ session_id: id })), isAgentPane: !!saved.isAgentPane }
     }
-    const tab = await findOwnTab($, true)
-    const role = await $.env.get('CLAUDE_TERMINAL_ROLE')
-    conductor = role === 'conductor' || (role !== 'session' && !!tab?.isAgentPane)
+    await findOwnTab($, true)
     statusSince = await $.clock.now()
     await publishSelf($)
     $.clock.every(60000, () => publishSelf($))
-    if (!conductor) return next(e)
 
     await registerTools($)
     try { await $.command.register({ name: 'fix', description: 'Fix the last failed command in this tab', argumentHint: '[note]' }) } catch { /* taken */ }
@@ -768,7 +821,7 @@ export function register(on) {
     return r
   })
 
-  // Control messages from the conductor, and its results coming back.
+  // Control messages from another session running this mod, and their results.
   on('session.receive', async ($, e, next) => {
     if (e.agentId || e.origin?.kind !== 'peer-send-message') return next(e)
     const control = unpack(CONTROL, e.text)
@@ -788,7 +841,7 @@ export function register(on) {
 
   // Add the terminal note to each message the user sends.
   on('prompt.submit', async ($, e, next) => {
-    if (!conductor || e.command || e.isMeta) return next(e)
+    if (e.command || e.isMeta) return next(e)
     const blocks = []
     if (!introSent) {
       blocks.push(INTRO)
