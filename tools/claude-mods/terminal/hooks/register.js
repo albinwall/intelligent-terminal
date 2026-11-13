@@ -521,7 +521,11 @@ async function toolHandoff($, e) {
   const r = await wt($, args)
   if (r.error) return r.error
   if (e.close_this) $.clock.after(20000, () => exitSelf($))
-  return `Started a fresh session in a new ${splitSelf ? 'split' : 'tab'} in ${cwd} with ${flags.length ? flags.join(' ') : 'default flags'}.${e.close_this ? ' This session exits in 20 seconds.' : ''}`
+  // Show the new pane once it has started, so a prompt waiting there (such as
+  // Claude Code asking whether to trust a new folder) isn't missed.
+  await $.clock.sleep(6000)
+  const screen = r.session_id ? await screenTail($, norm(r.session_id), 12) : ''
+  return `Started a fresh session in a new ${splitSelf ? 'split' : 'tab'} (pane ${norm(r.session_id)}) in ${cwd} with ${flags.length ? flags.join(' ') : 'default flags'}.${e.close_this ? ' This session exits in 20 seconds.' : ''}${screen ? `\nIts screen now:\n${clip(screen, 1500)}` : ''}`
 }
 
 async function exitSelf($) {
