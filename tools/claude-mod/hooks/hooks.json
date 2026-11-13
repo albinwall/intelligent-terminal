@@ -1,0 +1,4 @@
+{
+  "description": "Terminal context, pane tools and failed-command fixes",
+  "modules": ["./register.js"]
+}

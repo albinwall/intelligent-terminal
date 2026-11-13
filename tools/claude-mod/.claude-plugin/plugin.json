@@ -1,0 +1,9 @@
+{
+  "name": "terminal",
+  "description": "Intelligent Terminal features for Claude Code: terminal context, pane tools and fixes for failed commands",
+  "version": "0.1.0",
+  "author": {
+    "name": "albinwall"
+  },
+  "license": "MIT"
+}
