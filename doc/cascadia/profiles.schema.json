@@ -3261,6 +3261,13 @@
           ],
           "pattern": "^(|host:[^:]+|wsl:[^:]+:[^:]+)$"
         },
+        "agentPane.commandline": {
+          "description": "A command the agent pane runs for tabs of this profile instead of wta. Empty uses the Agent Pane profile's command line if it has one, else wta.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "commandPaletteAgent": {
           "description": "Selects the agent used for command palette delegation from this profile. An empty value uses the global Windows-hosted delegate agent. An explicit host or WSL selection is strict and never falls back to another agent.",
           "type": [

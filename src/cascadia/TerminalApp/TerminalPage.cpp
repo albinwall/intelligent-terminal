@@ -1359,9 +1359,15 @@ namespace winrt::TerminalApp::implementation
         return winrt::hstring{};
     }
 
-    // Returns the command line set on the Agent Pane profile, or empty if it isn't set.
-    winrt::hstring TerminalPage::_CustomAgentPaneCommandline() const
+    // Returns the agent pane command line for a tab whose profile is sourceProfile: that
+    // profile's agentPane.commandline, else the command line set on the Agent Pane
+    // profile, else empty.
+    winrt::hstring TerminalPage::_CustomAgentPaneCommandline(const Profile& sourceProfile) const
     {
+        if (sourceProfile && !sourceProfile.AgentPaneCommandline().empty())
+        {
+            return sourceProfile.AgentPaneCommandline();
+        }
         const auto profileId = _settings.GlobalSettings().AiCoordinatorProfile();
         if (!std::wstring_view{ profileId }.starts_with(L'{'))
         {
@@ -4390,16 +4396,23 @@ namespace winrt::TerminalApp::implementation
             return false;
         }
 
-        // If the Agent Pane profile has its own command line, run that instead of wta.
-        // Start it when the pane is opened, don't pre-warm it in every tab.
-        const auto customAgentPaneCommandline = _CustomAgentPaneCommandline();
-        if (!customAgentPaneCommandline.empty() && autoStash)
+        const auto& globals = _settings.GlobalSettings();
+        const auto sourceProfile = _ResolveAgentSourceProfile(tab, _settings);
+
+        // If the tab's profile or the Agent Pane profile has its own command line, run
+        // that instead of wta. Unless agentPane.prewarmCustomCommand is on, start it when
+        // the pane is opened rather than ahead of time in every tab; a conversation a
+        // restore wanted back waits for that first open.
+        const auto customAgentPaneCommandline = _CustomAgentPaneCommandline(sourceProfile);
+        if (!customAgentPaneCommandline.empty() && autoStash && !globals.AgentPanePrewarmCustomCommand())
         {
+            if (!initialLoadSessionId.empty())
+            {
+                _pendingLoadSessions.insert_or_assign(tab->StableId(), _PendingLoadSession{ .sessionId = std::string{ initialLoadSessionId }, .cwd = std::string{ initialLoadCwd } });
+            }
             return false;
         }
 
-        const auto& globals = _settings.GlobalSettings();
-        const auto sourceProfile = _ResolveAgentSourceProfile(tab, _settings);
         if (sourceProfile)
         {
             tab->AgentSourceProfileGuid(_AgentSourceProfileGuid(sourceProfile, _settings));
@@ -6085,7 +6098,17 @@ namespace winrt::TerminalApp::implementation
 
         _agentPaneLog("no agent pane on focused tab, creating new one");
 
-        if (!_AutoCreateHiddenAgentPaneShared(focusedTab, intoSessionsView, /*autoStash*/ false, std::string_view{}, std::string_view{}, initialAuthAgent))
+        // A conversation a restore left for this tab comes back with the pane.
+        std::string pendingSid;
+        std::string pendingCwd;
+        if (const auto it = _pendingLoadSessions.find(focusedTab->StableId()); it != _pendingLoadSessions.end())
+        {
+            pendingSid = std::move(it->second.sessionId);
+            pendingCwd = std::move(it->second.cwd);
+            _pendingLoadSessions.erase(it);
+        }
+
+        if (!_AutoCreateHiddenAgentPaneShared(focusedTab, intoSessionsView, /*autoStash*/ false, pendingSid, pendingCwd, initialAuthAgent))
         {
             _agentPaneLog("_OpenOrReuseAgentPane: _AutoCreateHiddenAgentPaneShared failed");
             return;

@@ -95,6 +95,7 @@ Author(s):
     X(winrt::Windows::Foundation::Collections::IVector<winrt::hstring>, DelegateCustomCommands, "delegateCustomCommands", winrt::single_threaded_vector<winrt::hstring>())                               \
     X(hstring, AgentPanePosition, "agentPanePosition", L"bottom")                                                                                                                                       \
     X(bool, AgentPaneYoloMode, "agentPane.yoloMode", false)                                                                                                                                             \
+    X(bool, AgentPanePrewarmCustomCommand, "agentPane.prewarmCustomCommand", false)                                                                                                                     \
     X(bool, AiCoordinatorEnabled, "aiIntegration.coordinator.enabled", false)                                                                                                                          \
     X(hstring, AiCoordinatorCommandline, "aiIntegration.coordinator.commandline", L"wta")                                                                                                                     \
     X(hstring, AiCoordinatorProfile, "aiIntegration.coordinator.profile", L"{fd19208a-412b-4857-8a2d-9ca592b4b16e}")                                                                                   \
@@ -123,6 +124,7 @@ Author(s):
     X(hstring, AgentProfileArguments, "agentProfile.arguments", L"")                                                                                            \
     X(hstring, DefaultSplitProfile, "defaultSplitProfile", L"")                                                                                                \
     X(hstring, AgentPaneBackend, "agentPaneBackend", L"")                                                                                                      \
+    X(hstring, AgentPaneCommandline, "agentPane.commandline", L"")                                                                                             \
     X(hstring, CommandPaletteAgent, "commandPaletteAgent", L"")                                                                                                \
     X(IMediaResource, Icon, "icon", implementation::MediaResource::FromString(L"\uE756"))                                                                      \
     X(bool, SuppressApplicationTitle, "suppressApplicationTitle", false)                                                                                       \

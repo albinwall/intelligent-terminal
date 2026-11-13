@@ -260,10 +260,17 @@ namespace winrt::TerminalApp::implementation
                     text += L" ";
                     text += _agentVersion;
                 }
-                if (_agentState == L"connected" && !_agentModel.empty())
+                // A custom agent can report "working" or "idle" in place of "connected".
+                const bool live = _agentState == L"connected" || _agentState == L"working" || _agentState == L"idle";
+                if (live && !_agentModel.empty())
                 {
                     text += L" \u00B7 ";
                     text += _agentModel;
+                }
+                if (_agentState == L"working")
+                {
+                    text += L" \u00B7 ";
+                    text += RS_(L"AgentPane_WorkingState");
                 }
             }
         }

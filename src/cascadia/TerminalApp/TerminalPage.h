@@ -1519,7 +1519,7 @@ namespace winrt::TerminalApp::implementation
         // Agent pane helpers
         winrt::hstring _DetectAgentCli() const;
         winrt::hstring _DetectWtaPath() const;
-        winrt::hstring _CustomAgentPaneCommandline() const;
+        winrt::hstring _CustomAgentPaneCommandline(const winrt::Microsoft::Terminal::Settings::Model::Profile& sourceProfile) const;
         std::optional<uint32_t> _FindSourceOfAgentPaneId(const std::shared_ptr<Pane>& root);
         void _DelegatePromptToAgent(const winrt::hstring& prompt);
         void _OpenBackgroundAgentTab();
