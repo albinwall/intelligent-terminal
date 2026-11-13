@@ -29,6 +29,8 @@ const KEYS = {
 }
 
 let settings = {}
+let hostFamily = null
+let inTerminal = false
 let sessionId = ''
 let selfPane = ''
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
@@ -83,12 +85,42 @@ function keyBytes(key) {
   return key
 }
 
-// Programs started inside an app package (such as the agent pane) can't use the shared
-// app alias folder, only each app's own one, so look there when the plain name fails.
+async function runs($, path) {
+  try {
+    return (await $.process.run([path, '--help'], { timeoutMs: 5000 })).exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+// The app package of the terminal window this session runs in, so that with two
+// Intelligent Terminals installed (say the Store one and a Dev build) the mod talks to its
+// own. Empty when there is none, such as outside Windows Terminal.
+async function findHostFamily($) {
+  const script = '$p = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"; for ($i = 0; $i -lt 12 -and $p; $i++) { if ($p.Name -eq "WindowsTerminal.exe") { $dir = Split-Path $p.ExecutablePath; (Get-AppxPackage | Where-Object { $_.InstallLocation -eq $dir } | Select-Object -First 1).PackageFamilyName; break }; $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.ParentProcessId) }'
+  try {
+    const r = await $.process.run(['powershell.exe', '-NoProfile', '-NoLogo', '-Command', script], { timeoutMs: 20000 })
+    return r.stdout.trim()
+  } catch {
+    return ''
+  }
+}
+
+// Finds a program of the terminal's: first in the alias folder of the terminal this session
+// runs in, else by its plain name, else in each app's own alias folder (programs started
+// inside an app package, such as the agent pane, can't use the shared one). Null when the
+// session runs in a terminal that doesn't have it.
 async function exe($, name) {
   if (exePaths.has(name)) return exePaths.get(name)
-  const candidates = [name]
   const local = await $.env.get('LOCALAPPDATA')
+  if (hostFamily === null) hostFamily = await findHostFamily($)
+  if (hostFamily) {
+    const own = `${local}\\Microsoft\\WindowsApps\\${hostFamily}\\${name}`
+    const found = local && (await runs($, own)) ? own : null
+    exePaths.set(name, found)
+    return found
+  }
+  const candidates = [name]
   if (local) {
     const apps = `${local}\\Microsoft\\WindowsApps`
     try {
@@ -106,14 +138,9 @@ async function exe($, name) {
     }
   }
   for (const candidate of candidates) {
-    try {
-      const r = await $.process.run([candidate, '--help'], { timeoutMs: 5000 })
-      if (r.exitCode === 0) {
-        exePaths.set(name, candidate)
-        return candidate
-      }
-    } catch {
-      // Not there; try the next one.
+    if (await runs($, candidate)) {
+      exePaths.set(name, candidate)
+      return candidate
     }
   }
   exePaths.set(name, name)
@@ -121,8 +148,10 @@ async function exe($, name) {
 }
 
 async function wt($, args, stdin) {
+  const wtcli = await exe($, WTCLI)
+  if (!wtcli) return { error: `${args[0]}: this terminal has no wtcli` }
   try {
-    const r = await $.process.run([await exe($, WTCLI), '--json', ...args], stdin ? { stdin, timeoutMs: 10000 } : { timeoutMs: 10000 })
+    const r = await $.process.run([wtcli, '--json', ...args], stdin ? { stdin, timeoutMs: 10000 } : { timeoutMs: 10000 })
     if (r.exitCode !== 0) return { error: `${args[0]}: ${(r.stderr || r.stdout || 'wtcli failed').trim()}` }
     try { return JSON.parse(r.stdout) } catch { return { text: r.stdout } }
   } catch (err) {
@@ -249,8 +278,10 @@ async function terminalNote($) {
 
 async function publish($, method, params) {
   const evt = JSON.stringify({ type: 'event', method, params: { ...params, tab_id: tabStableId } })
+  const wtcli = await exe($, WTCLI)
+  if (!wtcli) return
   try {
-    await $.process.run([await exe($, WTCLI), 'publish', '--existing-only', '--stdin'], { stdin: evt, timeoutMs: 5000 })
+    await $.process.run([wtcli, 'publish', '--existing-only', '--stdin'], { stdin: evt, timeoutMs: 5000 })
   } catch {
     // Terminal isn't there; nothing to update.
   }
@@ -270,7 +301,7 @@ async function publishBar($) {
   let status, state
   try {
     const [model, usage, version] = await Promise.all([$.session.model(), $.session.usage(), $.session.version()])
-    status = { name: 'Claude Code', version: version.version, model: modelName(model), state: 'connected' }
+    status = { name: 'Claude Code', version: version.version, model: modelName(model), state: busy ? 'working' : 'idle' }
     const items = []
     const c = usage.context
     if (typeof c?.tokens === 'number' && c.window > 0 && c.tokens <= c.window) {
@@ -407,6 +438,7 @@ async function onEvent($, line) {
 }
 
 async function listen($) {
+  if (!(await exe($, WTCLI))) return
   for (;;) {
     let buf = ''
     try {
@@ -695,6 +727,9 @@ export function register(on, options) {
     if (selfPane && saved?.wtPane === selfPane && saved.tabPanes?.length) {
       ownTab = { at: 0, windowId: 0, tabIndex: 0, panes: saved.tabPanes.map(id => ({ session_id: id })), isAgentPane: !!saved.isAgentPane }
     }
+    // Outside an Intelligent Terminal pane the mod adds nothing: no tools, no notes.
+    inTerminal = !!selfPane && !(await wt($, ['active-pane'])).error
+    if (!inTerminal) return next(e)
     await findOwnTab($, true)
     await remember($)
     await registerTools($)
@@ -725,7 +760,7 @@ export function register(on, options) {
 
   // The intro once, then a note about the user's pane with each message they send.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command || e.isMeta) return next(e)
+    if (e.command || e.isMeta || !inTerminal) return next(e)
     const blocks = []
     if (!introSent) {
       blocks.push(INTRO)

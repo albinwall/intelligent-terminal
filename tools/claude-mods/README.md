@@ -20,9 +20,12 @@ Check a mod with `claude plugin validate <folder>`.
 
 Give the hidden "Agent Pane" profile a `commandline`, for example
 `claude.exe --plugin-dir <this folder>\terminal`, and the agent pane runs it instead of wta.
+A profile can have its own with `"agentPane.commandline"`, used for tabs of that profile.
+The command starts when the pane is first opened in a tab; set the global
+`"agentPane.prewarmCustomCommand": true` to start it ahead of time in every tab, as wta is.
 Intelligent Terminal starts that command with two environment variables:
 
 - `WT_AGENT_TAB_ID`: the tab the pane belongs to. The `terminal` mod uses it to send the
-  agent name, model, context and cost to the agent bar and the status bar.
+  agent name, model, busy or idle, context and cost to the agent bar and the status bar.
 - `WT_AGENT_RESUME_SESSION_ID`: set when a restored layout brings the pane back. The
   `terminal` mod resumes that conversation; the pane starts in the folder it had.
