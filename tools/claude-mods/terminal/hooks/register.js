@@ -35,6 +35,8 @@ let sessionId = ''
 let selfPane = ''
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
 let tabStableId = ''
+let agentTabId = ''
+let tabGuessed = false
 let lastBar = ''
 let barTimer = null
 let lastShellPane = ''
@@ -212,6 +214,10 @@ async function findOwnTab($, fresh) {
   }
   if (!ownTab) {
     // Not listed and nothing known yet: an agent pane that just opened in the focused tab.
+    // Guessed once; a pane started ahead of time in a background tab corrects it from
+    // the tab id on its tab's events.
+    if (tabGuessed) return null
+    tabGuessed = true
     const active = await wt($, ['active-pane'])
     if (active.session_id && norm(active.session_id) !== selfPane) {
       const list = await wt($, ['list-panes', '-w', String(active.window_id), '-t', String(active.tab_id)])
@@ -221,6 +227,22 @@ async function findOwnTab($, fresh) {
   }
   ownTab.at = Date.now()
   return ownTab
+}
+
+// Takes the tab holding pane as this agent pane's own.
+async function adoptTabOf($, pane) {
+  const wins = await wt($, ['list-windows'])
+  for (const w of wins.windows ?? []) {
+    const tabs = await wt($, ['list-tabs', '-w', String(w.window_id)])
+    for (const t of tabs.tabs ?? []) {
+      const list = await wt($, ['list-panes', '-w', String(w.window_id), '-t', String(t.tab_id)])
+      if ((list.panes ?? []).some(p => norm(p.session_id) === pane)) {
+        ownTab = { at: Date.now(), windowId: w.window_id, tabIndex: t.tab_id, panes: list.panes, isAgentPane: true }
+        await remember($)
+        return
+      }
+    }
+  }
 }
 
 // Kept so a reload of the mod finds the same tab again.
@@ -400,7 +422,17 @@ async function onEvent($, line) {
     if (!seq.startsWith('osc:133;')) return
     const pane = norm(p.pane_id)
     if (!pane || pane === selfPane) return
-    if (!(await paneInOwnTab($, pane))) return
+    if (agentTabId && p.tab_id) {
+      // The terminal told this agent pane its tab, so the event's tab id decides.
+      const inList = !!ownTab?.panes.some(x => norm(x.session_id) === pane)
+      if (String(p.tab_id) !== agentTabId) {
+        if (inList) ownTab = null
+        return
+      }
+      if (!inList) await adoptTabOf($, pane)
+    } else if (!(await paneInOwnTab($, pane))) {
+      return
+    }
     if (p.tab_id && !tabStableId) {
       tabStableId = String(p.tab_id)
       publishBar($)
@@ -720,7 +752,8 @@ export function register(on, options) {
     selfPane = norm(await $.env.get('WT_SESSION'))
     sessionId = await $.session.id()
     // Intelligent Terminal names the tab when it starts this session as a tab's agent pane.
-    tabStableId = (await $.env.get('WT_AGENT_TAB_ID')) || tabStableId
+    agentTabId = (await $.env.get('WT_AGENT_TAB_ID')) || ''
+    tabStableId = agentTabId || tabStableId
     // After a reload, start from what this session knew about its tab.
     let saved = null
     try { saved = await $.store.get(MEMORY + sessionId) } catch { saved = null }
