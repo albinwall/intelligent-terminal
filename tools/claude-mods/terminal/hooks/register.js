@@ -38,6 +38,7 @@ let barTimer = null
 let lastShellPane = ''
 let failure = null // { pane, rawPane, code, summary, output, shell, cwd, dismissed }
 let fixPending = false
+let busy = false
 let introSent = false
 let listening = false
 const lastExit = new Map()
@@ -379,10 +380,14 @@ async function onEvent($, line) {
     lastExit.set(pane, code)
     doneCount.set(pane, (doneCount.get(pane) ?? 0) + 1)
     if (code !== 0) {
+      // Follow the terminal's own settings for error detection and automatic fixes.
+      const prefs = await wt($, ['get-settings'])
+      if (prefs.autoErrorDetectionEnabled === false) return
       failure = await failureFromPane($, pane, code)
       failure.rawPane = String(p.pane_id)
       $.ui.invalidate('ui.render')
       publishFixState($, { state: 'detected', pane_id: failure.rawPane, summary: failure.summary, hotkey_hint: 'Ctrl+Alt+.' })
+      if (prefs.autoFixEnabled === true && ownTab?.isAgentPane && !busy) startFix($, failure, 'fix', '')
     } else if (failure && failure.pane === pane) {
       failure = null
       $.ui.invalidate('ui.render')
@@ -706,7 +711,10 @@ export function register(on, options) {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) publishBar($)
+    if (!e.agentId) {
+      busy = true
+      publishBar($)
+    }
     return next(e)
   })
 
@@ -738,7 +746,10 @@ export function register(on, options) {
       fixPending = false
       publishFixState($, { state: 'cleared' })
     }
-    if (!e.agentId) publishBar($)
+    if (!e.agentId) {
+      busy = false
+      publishBar($)
+    }
     return r
   })
 
