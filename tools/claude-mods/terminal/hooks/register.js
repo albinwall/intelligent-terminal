@@ -11,7 +11,7 @@ const MEMORY = 'pane:'
 const INTRO = `You are running inside Intelligent Terminal (Windows Terminal with agent support). The mcp__terminal__ tools let you see and use the terminal:
 - panes lists windows, tabs and panes, with the agent CLI running in each. read reads a pane's screen, or just its last command and output.
 - run types a command into one of the user's shell panes and can wait for the result. type types text into one or more panes and presses Enter, for example a slash command into every pane running Claude Code. keys sends key presses such as Escape, Up, Down or C-c. Both return what the pane shows afterwards.
-- open opens a new tab or split, with an optional command, folder or profile. delegate starts another Claude in a new tab or split with a task.
+- open opens a new tab or split, with an optional command, folder or profile. delegate starts another Claude in a new tab or split with a task. handoff hands this session over to a fresh one next to it, after you write your handover.
 - profiles lists terminal profiles. resolve_command shows what a command name resolves to for a folder and shell. focus and close act on a pane.
 Each user message comes with a short "Terminal" note about the pane the user works in. Use that pane's shell syntax and folder for commands meant for it. Your own Bash or PowerShell tool runs in a separate process and doesn't change that pane. Read a pane before you act on it. Use run when the user wants something done in their pane; for questions, just answer.`
 
@@ -470,6 +470,64 @@ async function toolDelegate($, e) {
   return toolOpen($, { where: e.where, direction: e.direction, cwd: e.cwd, title: e.title, command: `claude ${quoteArg(task)}` })
 }
 
+// The command line this Claude Code process was started with, to start the next one alike.
+async function ownLaunch($) {
+  const script = '$p = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"; for ($i = 0; $i -lt 6 -and $p; $i++) { $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.ParentProcessId); if ($p -and $p.Name -like "claude*") { $p.CommandLine; break } }'
+  try {
+    const r = await $.process.run(['powershell.exe', '-NoProfile', '-NoLogo', '-Command', script], { timeoutMs: 15000 })
+    return r.stdout.trim()
+  } catch {
+    return ''
+  }
+}
+
+// The program and the flags worth passing on; a resume, a prompt or a session id are not.
+function launchFlags(commandLine) {
+  const tokens = [...String(commandLine).matchAll(/"([^"]*)"|(\S+)/g)].map(m => m[1] ?? m[2])
+  const valued = new Set(['--model', '--permission-mode', '--plugin-dir', '--add-dir', '--settings', '--mcp-config', '--effort', '--agent', '--append-system-prompt-file', '--system-prompt-file', '--fallback-model'])
+  const bare = new Set(['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--strict-mcp-config', '--chrome', '--no-chrome', '--ide', '--verbose'])
+  const flags = []
+  for (let i = 1; i < tokens.length; i++) {
+    const [key, value] = tokens[i].split(/=(.*)/s)
+    if (bare.has(tokens[i])) flags.push(tokens[i])
+    else if (valued.has(key)) {
+      if (value !== undefined) flags.push(key, value)
+      else if (i + 1 < tokens.length) flags.push(key, tokens[++i])
+    }
+  }
+  return { program: tokens[0] || 'claude.exe', flags }
+}
+
+function psQuote(s) {
+  return `'${String(s).replace(/'/g, "''")}'`
+}
+
+async function toolHandoff($, e) {
+  const prompt = String(e.prompt ?? '').trim()
+  if (!prompt) return 'No prompt given.'
+  const cwd = await $.session.cwd()
+  const temp = (await $.env.get('TEMP')) || cwd
+  const file = `${temp}\\claude-handoff-${Date.now()}.txt`
+  await $.fs.write(file, prompt)
+  const { program, flags } = launchFlags(await ownLaunch($))
+  // Split panes take no starting folder, so PowerShell moves there first.
+  const script = `Set-Location -LiteralPath ${psQuote(cwd)}; $p = Get-Content -LiteralPath ${psQuote(file)} -Raw -Encoding UTF8; Remove-Item -LiteralPath ${psQuote(file)}; & ${psQuote(program)} ${flags.map(psQuote).join(' ')} $p`
+  const command = `powershell.exe -NoProfile -NoLogo -Command "${script}"`
+  const tab = await findOwnTab($, true)
+  const splitSelf = e.where !== 'tab' && !tab?.isAgentPane && tab?.panes.some(p => norm(p.session_id) === selfPane)
+  const args = splitSelf
+    ? ['split-pane', '-t', selfPane, '-d', e.direction || 'auto', ...(e.size ? ['-s', String(e.size)] : []), '-c', command]
+    : ['new-tab', '-d', cwd, '-c', command]
+  const r = await wt($, args)
+  if (r.error) return r.error
+  if (e.close_this) $.clock.after(20000, () => exitSelf($))
+  return `Started a fresh session in a new ${splitSelf ? 'split' : 'tab'} in ${cwd} with ${flags.length ? flags.join(' ') : 'default flags'}.${e.close_this ? ' This session exits in 20 seconds.' : ''}`
+}
+
+async function exitSelf($) {
+  try { await $.command.run({ command: 'exit' }) } catch { /* the user can close it */ }
+}
+
 async function toolResolve($, e) {
   const name = String(e.name ?? '').trim()
   if (!name) return 'No command name given.'
@@ -493,6 +551,7 @@ async function runTool($, name, e) {
   if (name === 'open') return toolOpen($, e)
   if (name === 'delegate') return toolDelegate($, e)
   if (name === 'resolve_command') return toolResolve($, e)
+  if (name === 'handoff') return toolHandoff($, e)
   if (name === 'profiles') {
     const r = await wt($, ['list-profiles'])
     return r.error ?? JSON.stringify(r.profiles ?? r, null, 1)
@@ -518,6 +577,7 @@ async function registerTools($) {
     { name: 'keys', description: 'Send key presses to a terminal pane and return what it shows afterwards. Read the pane first: Escape closes a dialog, but in a Claude Code pane that is working it stops the turn. Names: Enter, Tab, S-Tab, Escape, BSpace, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Delete, F1 to F12, and C-<key> such as C-c. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
     { name: 'open', description: 'Open a new terminal tab or split, optionally running a command, in a folder (tabs only) or with a profile.', inputSchema: { type: 'object', properties: { where: { type: 'string', enum: ['tab', 'split'] }, command: { type: 'string' }, cwd: { type: 'string', description: 'Starting folder, for tabs.' }, profile: { type: 'string', description: 'Profile name or GUID from profiles.' }, direction, size: { type: 'number', description: 'Split size from 0.1 to 0.9.' }, title: { type: 'string' }, pane: { type: 'string', description: 'Pane to split. Default: the pane the user works in.' } }, required: ['where'] } },
     { name: 'delegate', description: 'Start another Claude Code session in a new tab or split with a task. Give it everything it needs: goal, context, folder and when it is done.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, where: { type: 'string', enum: ['tab', 'split'] }, cwd: { type: 'string' }, direction, title: { type: 'string' } }, required: ['task'] } },
+    { name: 'handoff', description: 'Hand this session over to a fresh Claude Code session in a split next to your own pane (or a new tab), in the same folder with the same launch flags. Write your handover first, then give the new session its first message, for example to read that handover and carry on.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: "The new session's first message." }, where: { type: 'string', enum: ['split', 'tab'], description: 'Default split.' }, direction, size: { type: 'number' }, close_this: { type: 'boolean', description: 'Exit this session 20 seconds after the new one starts. Default false.' } }, required: ['prompt'] } },
     { name: 'profiles', description: 'List the terminal profiles (id, name, default, agent).', inputSchema: { type: 'object', properties: {} } },
     { name: 'resolve_command', description: 'Find what a command name resolves to for a folder and shell, with close matches when it is not found.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, cwd: { type: 'string' }, shell: { type: 'string', description: 'For example pwsh.exe, powershell.exe, cmd.exe, bash.' } }, required: ['name'] } },
     { name: 'focus', description: 'Move focus to a terminal pane.', inputSchema: { type: 'object', properties: { pane }, required: ['pane'] } },
