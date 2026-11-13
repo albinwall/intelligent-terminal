@@ -28,6 +28,7 @@ const KEYS = {
   f9: '\x1b[20~', f10: '\x1b[21~', f11: '\x1b[23~', f12: '\x1b[24~',
 }
 
+let settings = {}
 let sessionId = ''
 let selfPane = ''
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
@@ -524,7 +525,14 @@ async function toolHandoff($, e) {
   // Show the new pane once it has started, so a prompt waiting there (such as
   // Claude Code asking whether to trust a new folder) isn't missed.
   await $.clock.sleep(6000)
-  const screen = r.session_id ? await screenTail($, norm(r.session_id), 12) : ''
+  const newPane = norm(r.session_id)
+  let screen = newPane ? await screenTail($, newPane, 12) : ''
+  if (newPane && /trust this folder/i.test(screen) && (e.trust_folder ?? settings.handoff_trust_folder)) {
+    await wt($, ['send-keys', '-t', newPane, '--raw', '--', KEYS.down])
+    await wt($, ['send-keys', '-t', newPane, '--raw', '--', KEYS.enter])
+    await $.clock.sleep(2000)
+    screen = `(answered yes to trusting ${cwd})\n${await screenTail($, newPane, 12)}`
+  }
   return `Started a fresh session in a new ${splitSelf ? 'split' : 'tab'} (pane ${norm(r.session_id)}) in ${cwd} with ${flags.length ? flags.join(' ') : 'default flags'}.${e.close_this ? ' This session exits in 20 seconds.' : ''}${screen ? `\nIts screen now:\n${clip(screen, 1500)}` : ''}`
 }
 
@@ -581,7 +589,7 @@ async function registerTools($) {
     { name: 'keys', description: 'Send key presses to a terminal pane and return what it shows afterwards. Read the pane first: Escape closes a dialog, but in a Claude Code pane that is working it stops the turn. Names: Enter, Tab, S-Tab, Escape, BSpace, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Delete, F1 to F12, and C-<key> such as C-c. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
     { name: 'open', description: 'Open a new terminal tab or split, optionally running a command, in a folder (tabs only) or with a profile.', inputSchema: { type: 'object', properties: { where: { type: 'string', enum: ['tab', 'split'] }, command: { type: 'string' }, cwd: { type: 'string', description: 'Starting folder, for tabs.' }, profile: { type: 'string', description: 'Profile name or GUID from profiles.' }, direction, size: { type: 'number', description: 'Split size from 0.1 to 0.9.' }, title: { type: 'string' }, pane: { type: 'string', description: 'Pane to split. Default: the pane the user works in.' } }, required: ['where'] } },
     { name: 'delegate', description: 'Start another Claude Code session in a new tab or split with a task. Give it everything it needs: goal, context, folder and when it is done.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, where: { type: 'string', enum: ['tab', 'split'] }, cwd: { type: 'string' }, direction, title: { type: 'string' } }, required: ['task'] } },
-    { name: 'handoff', description: 'Hand this session over to a fresh Claude Code session in a split next to your own pane (or a new tab), in the same folder with the same launch flags. Write your handover first, then give the new session its first message, for example to read that handover and carry on.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: "The new session's first message." }, where: { type: 'string', enum: ['split', 'tab'], description: 'Default split.' }, direction, size: { type: 'number' }, close_this: { type: 'boolean', description: 'Exit this session 20 seconds after the new one starts. Default false.' } }, required: ['prompt'] } },
+    { name: 'handoff', description: 'Hand this session over to a fresh Claude Code session in a split next to your own pane (or a new tab), in the same folder with the same launch flags. Write your handover first, then give the new session its first message, for example to read that handover and carry on.', inputSchema: { type: 'object', properties: { prompt: { type: 'string', description: "The new session's first message." }, where: { type: 'string', enum: ['split', 'tab'], description: 'Default split.' }, direction, size: { type: 'number' }, close_this: { type: 'boolean', description: 'Exit this session 20 seconds after the new one starts. Default false.' }, trust_folder: { type: 'boolean', description: 'If the new session asks whether to trust the folder, answer yes. Default: the mod setting handoff_trust_folder.' } }, required: ['prompt'] } },
     { name: 'profiles', description: 'List the terminal profiles (id, name, default, agent).', inputSchema: { type: 'object', properties: {} } },
     { name: 'resolve_command', description: 'Find what a command name resolves to for a folder and shell, with close matches when it is not found.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, cwd: { type: 'string' }, shell: { type: 'string', description: 'For example pwsh.exe, powershell.exe, cmd.exe, bash.' } }, required: ['name'] } },
     { name: 'focus', description: 'Move focus to a terminal pane.', inputSchema: { type: 'object', properties: { pane }, required: ['pane'] } },
@@ -594,7 +602,8 @@ async function registerTools($) {
 
 // ---------- hooks ----------
 
-export function register(on) {
+export function register(on, options) {
+  settings = options ?? {}
   on('session.start', async ($, e, next) => {
     selfPane = norm(await $.env.get('WT_SESSION'))
     sessionId = await $.session.id()

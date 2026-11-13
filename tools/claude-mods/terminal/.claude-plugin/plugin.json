@@ -5,5 +5,13 @@
   "author": {
     "name": "albinwall"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "handoff_trust_folder": {
+      "type": "boolean",
+      "title": "Trust the folder in a handoff",
+      "description": "When a handoff starts the new session in a folder Claude Code has not trusted yet, answer its trust question with yes instead of leaving it for you.",
+      "default": false
+    }
+  }
 }
