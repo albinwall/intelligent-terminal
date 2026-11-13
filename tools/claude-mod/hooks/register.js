@@ -222,7 +222,10 @@ async function terminalNote($) {
   const p = await sourcePane($)
   if (!p) return ''
   const pane = norm(p.session_id)
-  let note = `Terminal: the user's pane is ${pane} "${p.title ?? ''}", ${p.shell ?? 'unknown shell'}${p.shell_version ? ' ' + p.shell_version : ''} in ${p.cwd ?? 'an unknown folder'}.`
+  const what = `${pane} "${p.title ?? ''}", ${p.shell ?? 'unknown shell'}${p.shell_version ? ' ' + p.shell_version : ''} in ${p.cwd ?? 'an unknown folder'}`
+  let note = ownTab?.isAgentPane
+    ? `Terminal: you are in this tab's agent pane (${selfPane}). The pane it is attached to, where the user runs commands, is ${what}.`
+    : `Terminal: you are in pane ${selfPane}. The other pane in this tab, where the user runs commands, is ${what}.`
   const last = await wt($, ['capture-pane', '-t', pane, '--last-prompt', '-l', '30'])
   if (last.has_marks && last.content) {
     const code = lastExit.get(pane)
@@ -570,6 +573,10 @@ async function toolPanes($) {
         })
       }
     }
+  }
+  // Terminal leaves agent panes out of its lists; add this session's own.
+  if (selfPane && !out.some(p => p.you)) {
+    out.push({ window: ownTab?.windowId, tab: ownTab?.tabIndex, pane: selfPane, agent: 'claude', agent_pane: !!ownTab?.isAgentPane, you: true })
   }
   return JSON.stringify(out, null, 1)
 }
