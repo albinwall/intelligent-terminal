@@ -33,6 +33,8 @@ let sessionId = ''
 let selfPane = ''
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
 let tabStableId = ''
+let lastBar = ''
+let barTimer = null
 let lastShellPane = ''
 let failure = null // { pane, rawPane, code, summary, output, shell, cwd, dismissed }
 let fixPending = false
@@ -125,6 +127,22 @@ async function wt($, args, stdin) {
   } catch (err) {
     return { error: `${args[0]}: ${String(err?.message ?? err)}` }
   }
+}
+
+// Line breaks don't survive as a process argument, so they go as wtcli's Enter key.
+async function sendText($, pane, text) {
+  const parts = String(text).split(/\r\n|\r|\n/)
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      const r = await wt($, ['send-keys', '-t', pane, 'Enter'])
+      if (r.error) return r
+    }
+    if (parts[i]) {
+      const r = await wt($, ['send-keys', '-t', pane, '--raw', '--', parts[i]])
+      if (r.error) return r
+    }
+  }
+  return {}
 }
 
 async function screenTail($, pane, lines) {
@@ -226,16 +244,75 @@ async function terminalNote($) {
   return note
 }
 
-// ---------- failed commands ----------
+// ---------- events for the terminal ----------
 
-async function publishFixState($, params) {
-  if (!ownTab?.isAgentPane || !tabStableId) return
-  const evt = JSON.stringify({ type: 'event', method: 'autofix_state', params: { ...params, tab_id: tabStableId } })
+async function publish($, method, params) {
+  const evt = JSON.stringify({ type: 'event', method, params: { ...params, tab_id: tabStableId } })
   try {
     await $.process.run([await exe($, WTCLI), 'publish', '--existing-only', '--stdin'], { stdin: evt, timeoutMs: 5000 })
   } catch {
     // Terminal isn't there; nothing to update.
   }
+}
+
+// claude-opus-5-5 -> Opus 5.5, the way Claude Code names its models.
+function modelName(id) {
+  const m = String(id ?? '').match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?=-|\[|$)/i)
+  return m ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? '.' + m[3] : ''}` : String(id ?? '')
+}
+
+// As a tab's agent pane, fill the terminal's agent bar (agent, version, model) and its
+// status bar (context and cost), and tell it the session id so a restored layout can
+// bring the conversation back.
+async function publishBar($) {
+  if (!ownTab?.isAgentPane || !tabStableId) return
+  let status, state
+  try {
+    const [model, usage, version] = await Promise.all([$.session.model(), $.session.usage(), $.session.version()])
+    status = { name: 'Claude Code', version: version.version, model: modelName(model), state: 'connected' }
+    const items = []
+    const c = usage.context
+    if (typeof c?.tokens === 'number' && c.window > 0 && c.tokens <= c.window) {
+      items.push({ metric_id: 'acp.context.window', display_kind: 'context', value_decimal_text: String(c.tokens), limit_decimal_text: String(c.window), unit_id: 'token', unit_display_text: 'token', scope: 'session', source: 'acp_standard', stale: false })
+    }
+    if (usage.cost && usage.cost.usd >= 0) {
+      items.push({ metric_id: 'acp.billing.cost', display_kind: 'billing', value_decimal_text: usage.cost.usd.toFixed(4), unit_id: 'USD', unit_display_text: 'USD', scope: 'session', source: 'acp_standard', stale: false })
+    }
+    state = { agent_session_id: sessionId, usage: { items } }
+  } catch {
+    return
+  }
+  const key = JSON.stringify([tabStableId, status, state])
+  if (key === lastBar) return
+  lastBar = key
+  await publish($, 'agent_status', status)
+  await publish($, 'agent_state_changed', state)
+}
+
+// When Intelligent Terminal brings back a layout, it starts the agent pane with the id of
+// the conversation that pane had. Resume it once, while nothing has been typed yet.
+async function resumeFromTerminal($) {
+  const id = await $.env.get('WT_AGENT_RESUME_SESSION_ID')
+  if (!id || id === sessionId || !selfPane) return
+  const key = 'resumed:' + selfPane
+  try {
+    if (await $.store.get(key)) return
+    await $.store.set(key, id)
+    if ((await $.session.turns()) > 0) return
+  } catch {
+    return
+  }
+  // Outside the start hook, so the command can queue.
+  $.clock.after(0, async () => {
+    try { await $.command.run({ command: 'resume', args: id }) } catch { /* the user can /resume */ }
+  })
+}
+
+// ---------- failed commands ----------
+
+async function publishFixState($, params) {
+  if (!ownTab?.isAgentPane || !tabStableId) return
+  await publish($, 'autofix_state', params)
 }
 
 function describeFailure(f) {
@@ -249,11 +326,12 @@ async function failureFromPane($, pane, code) {
   if (!cap.has_marks) output = await screenTail($, pane, 40)
   const info = paneInfo(pane)
   const exit = code ?? lastExit.get(pane) ?? 1
-  const cmd = firstLine(output).replace(/^.*?>\s*/, '') || 'The last command'
+  // The capture starts at the command; its output can follow on the same line after padding.
+  const cmd = (cap.has_marks && firstLine(output).split(/\s{3,}/)[0]) || 'The last command'
   return {
     pane,
     code: exit,
-    summary: `${clip(cmd, 60).replace(/^\.\.\./, '')} failed (exit ${exit})`,
+    summary: `${cmd.length > 60 ? cmd.slice(0, 59) + '…' : cmd} failed (exit ${exit})`,
     output: clip(output, 3000),
     shell: info?.shell ?? '',
     cwd: info?.cwd ?? '',
@@ -291,7 +369,10 @@ async function onEvent($, line) {
     const pane = norm(p.pane_id)
     if (!pane || pane === selfPane) return
     if (!(await paneInOwnTab($, pane))) return
-    if (p.tab_id) tabStableId = String(p.tab_id)
+    if (p.tab_id && !tabStableId) {
+      tabStableId = String(p.tab_id)
+      publishBar($)
+    }
     lastShellPane = pane
     if (!seq.startsWith('osc:133;D')) return
     const code = parseInt(seq.split(';')[2] ?? '0', 10) || 0
@@ -393,10 +474,8 @@ async function toolRun($, e) {
   if (!pane) return 'No pane to run it in.'
   if (pane === selfPane) return "That's your own pane. Pick one of the user's panes."
   const before = doneCount.get(pane) ?? 0
-  const sent = await wt($, ['send-keys', '-t', pane, '--raw', '--', command])
+  const sent = await sendText($, pane, command + '\n')
   if (sent.error) return sent.error
-  const enter = await wt($, ['send-keys', '-t', pane, 'Enter'])
-  if (enter.error) return enter.error
   if (e.wait === false) return `Sent to pane ${pane}.`
   // Wait a few seconds for the command to finish (needs shell integration).
   for (let waited = 0; waited < 7000 && (doneCount.get(pane) ?? 0) === before; waited += 350) {
@@ -415,12 +494,8 @@ async function toolType($, e) {
   const sentTo = []
   for (const pane of panes) {
     if (pane === selfPane) { out.push(`${pane}: skipped, that's your own pane`); continue }
-    const sent = await wt($, ['send-keys', '-t', pane, '--raw', '--', text])
+    const sent = await sendText($, pane, e.enter === false ? text : text + '\n')
     if (sent.error) { out.push(`${pane}: ${sent.error}`); continue }
-    if (e.enter !== false) {
-      const enter = await wt($, ['send-keys', '-t', pane, 'Enter'])
-      if (enter.error) { out.push(`${pane}: ${enter.error}`); continue }
-    }
     sentTo.push(pane)
   }
   // Show what each pane looks like now, so the next step isn't a guess.
@@ -440,7 +515,7 @@ async function toolKeys($, e) {
   if (!keys.length) return 'No keys given.'
   // One key at a time, so a program reads Escape and an arrow as two keys.
   for (const key of keys) {
-    const r = await wt($, ['send-keys', '-t', pane, '--raw', '--', keyBytes(key)])
+    const r = await sendText($, pane, keyBytes(key))
     if (r.error) return r.error
   }
   await $.clock.sleep(800)
@@ -528,8 +603,8 @@ async function toolHandoff($, e) {
   const newPane = norm(r.session_id)
   let screen = newPane ? await screenTail($, newPane, 12) : ''
   if (newPane && /trust this folder/i.test(screen) && (e.trust_folder ?? settings.handoff_trust_folder)) {
-    await wt($, ['send-keys', '-t', newPane, '--raw', '--', KEYS.down])
-    await wt($, ['send-keys', '-t', newPane, '--raw', '--', KEYS.enter])
+    await sendText($, newPane, KEYS.down)
+    await sendText($, newPane, KEYS.enter)
     await $.clock.sleep(2000)
     screen = `(answered yes to trusting ${cwd})\n${await screenTail($, newPane, 12)}`
   }
@@ -607,6 +682,8 @@ export function register(on, options) {
   on('session.start', async ($, e, next) => {
     selfPane = norm(await $.env.get('WT_SESSION'))
     sessionId = await $.session.id()
+    // Intelligent Terminal names the tab when it starts this session as a tab's agent pane.
+    tabStableId = (await $.env.get('WT_AGENT_TAB_ID')) || tabStableId
     // After a reload, start from what this session knew about its tab.
     let saved = null
     try { saved = await $.store.get(MEMORY + sessionId) } catch { saved = null }
@@ -622,6 +699,14 @@ export function register(on, options) {
       listening = true
       listen($)
     }
+    if (!barTimer) barTimer = $.clock.every(30000, () => publishBar($))
+    publishBar($)
+    await resumeFromTerminal($)
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) publishBar($)
     return next(e)
   })
 
@@ -653,6 +738,7 @@ export function register(on, options) {
       fixPending = false
       publishFixState($, { state: 'cleared' })
     }
+    if (!e.agentId) publishBar($)
     return r
   })
 
