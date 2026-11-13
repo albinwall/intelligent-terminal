@@ -230,8 +230,17 @@ async function terminalNote($) {
   if (last.has_marks && last.content) {
     const code = lastExit.get(pane)
     note += `\nIts last command${code === undefined ? '' : ` (exit ${code})`}:\n${clip(last.content, 1500)}`
+  } else {
+    // No shell prompt marks: a full-screen program, so show what is on screen now.
+    const screen = await screenTail($, pane, 20)
+    if (screen) note += `\nWhat it shows now (last lines):\n${clip(screen, 1500)}`
   }
   return note
+}
+
+async function screenTail($, pane, lines) {
+  const r = await wt($, ['capture-pane', '-t', pane, '-l', String(lines)])
+  return r.error ? '' : String(r.content ?? '').split(/\r?\n/).filter(l => l.trim()).join('\n')
 }
 
 async function publishFixState($, params) {
@@ -622,6 +631,7 @@ async function toolType($, e) {
   const text = String(e.text ?? '')
   if (!panes.length || !text) return 'Give the panes and the text.'
   const out = []
+  const sentTo = []
   for (const pane of panes) {
     if (pane === selfPane) { out.push(`${pane}: skipped, that's your own pane`); continue }
     const sent = await wt($, ['send-keys', '-t', pane, '--raw', '--', text])
@@ -630,9 +640,15 @@ async function toolType($, e) {
       const enter = await wt($, ['send-keys', '-t', pane, 'Enter'])
       if (enter.error) { out.push(`${pane}: ${enter.error}`); continue }
     }
-    out.push(`${pane}: sent`)
+    sentTo.push(pane)
   }
-  return out.join('\n')
+  // Show what each pane looks like now, so the next step isn't a guess.
+  if (sentTo.length) await $.clock.sleep(800)
+  const lines = sentTo.length > 4 ? 6 : 15
+  for (const pane of sentTo) {
+    out.push(`${pane}: sent. Its screen now:\n${clip(await screenTail($, pane, lines), 1500)}`)
+  }
+  return out.join('\n\n')
 }
 
 async function toolKeys($, e) {
@@ -642,7 +658,9 @@ async function toolKeys($, e) {
   const keys = (Array.isArray(e.keys) ? e.keys : [e.keys]).map(String).filter(k => k)
   if (!keys.length) return 'No keys given.'
   const r = await wt($, ['send-keys', '-t', pane, '--', ...keys])
-  return r.error ?? 'Sent.'
+  if (r.error) return r.error
+  await $.clock.sleep(800)
+  return `Sent. Its screen now:\n${clip(await screenTail($, pane, 15), 1500)}`
 }
 
 async function toolOpen($, e) {
@@ -742,10 +760,10 @@ async function registerTools($) {
   const direction = { type: 'string', enum: ['right', 'left', 'up', 'down', 'auto'] }
   const tools = [
     { name: 'panes', description: 'List Windows Terminal windows, tabs and panes with shell, folder, title, last exit code and the agent CLI running in the pane (agent, for example "claude"). Your own pane is marked "you".', inputSchema: { type: 'object', properties: {} } },
-    { name: 'type', description: 'Type text into the input of one or more terminal panes, then press Enter, as if the user typed it. For example a slash command into every pane running Claude Code (find them with panes). A newline in the text also presses Enter.', inputSchema: { type: 'object', properties: { panes: { type: 'array', items: { type: 'string' }, description: 'Pane ids from panes.' }, text: { type: 'string' }, enter: { type: 'boolean', description: 'Press Enter after the text. Default true.' } }, required: ['panes', 'text'] } },
+    { name: 'type', description: 'Type text into the input of one or more terminal panes, then press Enter, as if the user typed it, and returns what each pane shows afterwards. For example a slash command into every pane running Claude Code (find them with panes). Read a pane first to see what it shows now: in a Claude Code pane that is busy, text is queued, and an open dialog takes the keys. A newline in the text also presses Enter.', inputSchema: { type: 'object', properties: { panes: { type: 'array', items: { type: 'string' }, description: 'Pane ids from panes.' }, text: { type: 'string' }, enter: { type: 'boolean', description: 'Press Enter after the text. Default true.' } }, required: ['panes', 'text'] } },
     { name: 'read', description: "Read a terminal pane's screen, or just its last command and output.", inputSchema: { type: 'object', properties: { pane, lines: { type: 'integer', description: 'How many lines, up to 400. Default 60.' }, last_command: { type: 'boolean', description: 'Only the last command and its output (needs shell integration).' } } } },
     { name: 'run', description: "Type a command into one of the user's terminal panes and press Enter. The user approves it first. By default waits a few seconds and returns the output.", inputSchema: { type: 'object', properties: { command: { type: 'string', description: "The command, in that pane's shell syntax." }, pane, wait: { type: 'boolean', description: 'Wait for the result. Default true.' } }, required: ['command'] } },
-    { name: 'keys', description: 'Send key presses to a terminal pane, for example ["Escape"] to stop a Claude session, or ["/compact", "Enter"]. Names: Enter, Tab, Escape, BSpace, C-c and other C-<key>. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
+    { name: 'keys', description: 'Send key presses to a terminal pane and return what it shows afterwards. Read the pane first: Escape closes a dialog, but in a Claude Code pane that is working it stops the turn. Names: Enter, Tab, Escape, BSpace, C-c and other C-<key>. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
     { name: 'open', description: 'Open a new terminal tab or split, optionally running a command, in a folder (tabs only) or with a profile.', inputSchema: { type: 'object', properties: { where: { type: 'string', enum: ['tab', 'split'] }, command: { type: 'string' }, cwd: { type: 'string', description: 'Starting folder, for tabs.' }, profile: { type: 'string', description: 'Profile name or GUID from profiles.' }, direction, size: { type: 'number', description: 'Split size from 0.1 to 0.9.' }, title: { type: 'string' }, pane: { type: 'string', description: 'Pane to split. Default: the pane the user is working in.' } }, required: ['where'] } },
     { name: 'delegate', description: 'Start another Claude Code session in a new tab or split with a task. Give it everything it needs: goal, context, folder and when it is done.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, where: { type: 'string', enum: ['tab', 'split'] }, cwd: { type: 'string' }, direction, title: { type: 'string' } }, required: ['task'] } },
     { name: 'profiles', description: 'List the terminal profiles (id, name, default, agent).', inputSchema: { type: 'object', properties: {} } },
