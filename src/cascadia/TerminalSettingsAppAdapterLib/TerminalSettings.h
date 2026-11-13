@@ -98,6 +98,7 @@ namespace winrt::Microsoft::Terminal::Settings
         // TerminalApp overrides these when duplicating a session
         void StartingDirectory(const hstring& startingDirectory) { _StartingDirectory = startingDirectory; }
         void Commandline(const hstring& commandline) { _Commandline = commandline; }
+        void EnvironmentVariables(const IEnvironmentVariableMapView& environment) { _EnvironmentVariables = environment; }
         void UsesManagedAgentCommand(const bool value) { _UsesManagedAgentCommand = value; }
 
     private:

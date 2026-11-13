@@ -4797,8 +4797,38 @@ namespace winrt::TerminalApp::implementation
             args.StartingDirectory(winrt::hstring{ resolvedWorkingDirectories.helper });
         }
 
+        // A custom command can't take wta's flags, so it gets its tab and, when a
+        // conversation is being brought back, that conversation's id and folder
+        // as environment variables.
+        TerminalConnection::ITerminalConnection customConnection{ nullptr };
+        if (!customAgentPaneCommandline.empty())
+        {
+            if (!initialLoadSessionId.empty() && !initialLoadCwd.empty())
+            {
+                args.StartingDirectory(winrt::to_hstring(initialLoadCwd));
+            }
+            const auto profile = _settings.GetProfileForArgs(args);
+            const auto controlSettings = Settings::TerminalSettings::CreateWithNewTerminalArgs(_settings, args);
+            const auto defaults = controlSettings.DefaultSettings();
+            std::unordered_map<winrt::hstring, winrt::hstring> environment;
+            if (const auto profileEnvironment = defaults->EnvironmentVariables())
+            {
+                for (const auto& pair : profileEnvironment)
+                {
+                    environment.insert_or_assign(pair.Key(), pair.Value());
+                }
+            }
+            environment.insert_or_assign(L"WT_AGENT_TAB_ID", stableId);
+            if (!initialLoadSessionId.empty())
+            {
+                environment.insert_or_assign(L"WT_AGENT_RESUME_SESSION_ID", winrt::to_hstring(initialLoadSessionId));
+            }
+            defaults->EnvironmentVariables(winrt::single_threaded_map(std::move(environment)).GetView());
+            customConnection = _CreateConnectionFromSettings(profile, *defaults, false);
+        }
+
         SidebarUpdateBatch sidebarBatch{ *this, autoStash && _isVerticalLayout };
-        auto rawPane = _MakeTerminalPane(args, nullptr, nullptr);
+        auto rawPane = _MakeTerminalPane(args, nullptr, customConnection);
         if (!rawPane)
         {
             _agentPaneLog("_AutoCreateHiddenAgentPaneShared: _MakeTerminalPane returned null");
