@@ -1,0 +1,9 @@
+{
+  "name": "sessions",
+  "description": "Every Claude Code session on this machine, for every other: shared state, slash commands run on request, and a watcher that compacts sessions at good checkpoints",
+  "version": "0.1.0",
+  "author": {
+    "name": "albinwall"
+  },
+  "license": "MIT"
+}

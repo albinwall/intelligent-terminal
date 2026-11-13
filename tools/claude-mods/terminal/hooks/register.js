@@ -1,40 +1,35 @@
-// Intelligent Terminal features for Claude Code: tools for panes and sessions, a note about
-// the user's pane with each prompt, and a Fix line when a command fails in the same tab.
-// The terminal is reached through wtcli.exe, which ships with Intelligent Terminal.
+// Intelligent Terminal for Claude Code: tools to see and use the terminal's panes, a note
+// about the pane the user works in with each prompt, and a Fix line when a command fails
+// in the same tab. The terminal is reached through wtcli.exe, which ships with
+// Intelligent Terminal.
 
 const WTCLI = 'wtcli.exe'
 const PREFIX = 'mcp__terminal__'
-const NO_PROMPT_TOOLS = new Set(['panes', 'read', 'profiles', 'resolve_command', 'focus', 'sessions'])
-const FLEET = 'fleet:'
-const CONTROL = '[terminal-control]'
-const RESULT = '[terminal-result]'
-const FRESH_MS = 3 * 60000
+const NO_PROMPT_TOOLS = new Set(['panes', 'read', 'profiles', 'resolve_command', 'focus'])
+const MEMORY = 'pane:'
 
-const INTRO = `You are running inside Intelligent Terminal (Windows Terminal with agent support). The mcp__terminal__ tools let you see and use the terminal and the other Claude Code sessions:
+const INTRO = `You are running inside Intelligent Terminal (Windows Terminal with agent support). The mcp__terminal__ tools let you see and use the terminal:
 - panes lists windows, tabs and panes, with the agent CLI running in each. read reads a pane's screen, or just its last command and output.
-- run types a command into one of the user's shell panes and can wait for the result. type types text into one or more panes and presses Enter, for example a slash command into every pane running Claude Code. keys sends key presses such as Escape, Enter or C-c.
+- run types a command into one of the user's shell panes and can wait for the result. type types text into one or more panes and presses Enter, for example a slash command into every pane running Claude Code. keys sends key presses such as Escape, Up, Down or C-c. Both return what the pane shows afterwards.
 - open opens a new tab or split, with an optional command, folder or profile. delegate starts another Claude in a new tab or split with a task.
 - profiles lists terminal profiles. resolve_command shows what a command name resolves to for a folder and shell. focus and close act on a pane.
-- sessions lists every Claude Code session on this machine with busy or idle, idle time and context size. compact_session asks one to write its handover and run /compact. watch keeps an eye on all sessions and does that at good checkpoints. To talk to a session, use SendMessage.
-Each user message comes with a short "Terminal" note about the pane the user is working in. Use that pane's shell syntax and folder for commands meant for it. Your own Bash or PowerShell tool runs in a separate process and doesn't change that pane. Use run when the user wants something done in their pane; for questions, just answer.`
+Each user message comes with a short "Terminal" note about the pane the user works in. Use that pane's shell syntax and folder for commands meant for it. Your own Bash or PowerShell tool runs in a separate process and doesn't change that pane. Read a pane before you act on it. Use run when the user wants something done in their pane; for questions, just answer.`
 
 const FIX = `My last command failed. Work out what I was trying to do and why it failed, fix whatever needs fixing, then give me the corrected command with the terminal run tool so I can approve it. If it's an obvious typo, go straight to the corrected command. If you can't tell what I want, ask me. Your own shell is separate from that pane, so changes you make there don't affect it.`
 
 const EXPLAIN = `Explain why my last command failed. Don't run or change anything.`
 
-const HANDOVER = `Your context will be compacted next. Write your handover now, the way your project's rules say (if they say nothing, write a short one: the goal, what is done, what is in progress, decisions, file paths and next steps). Commit it if your project commits handovers. Then stop.`
-
-const COMPACT = `Keep the current goal, what is done and what is left, decisions and why, open problems, and the file paths and commands that matter. Drop exploration that led nowhere.`
-
-const CHECKPOINT = `You judge a coding agent's last message. Answer yes when it stopped at a good point to compact its context: a task or step is finished or handed off, results are reported, nothing is half done, and it is not waiting for an answer to a question it asked. Otherwise answer no. Reply with one word: yes or no.`
-
-const WATCH_DEFAULTS = { enabled: true, mode: 'ask', min_context_k: 400, min_idle_minutes: 3, handover: true, handover_prompt: '', instructions: '', checkpoint_check: true }
+// Key names for the keys tool, as the bytes a terminal sends for them.
+const KEYS = {
+  enter: '\r', tab: '\t', 's-tab': '\x1b[Z', escape: '\x1b', esc: '\x1b', bspace: '\x7f', backspace: '\x7f', space: ' ',
+  up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D', home: '\x1b[H', end: '\x1b[F',
+  pageup: '\x1b[5~', pagedown: '\x1b[6~', ppage: '\x1b[5~', npage: '\x1b[6~', delete: '\x1b[3~', dc: '\x1b[3~', insert: '\x1b[2~', ic: '\x1b[2~',
+  f1: '\x1bOP', f2: '\x1bOQ', f3: '\x1bOR', f4: '\x1bOS', f5: '\x1b[15~', f6: '\x1b[17~', f7: '\x1b[18~', f8: '\x1b[19~',
+  f9: '\x1b[20~', f10: '\x1b[21~', f11: '\x1b[23~', f12: '\x1b[24~',
+}
 
 let sessionId = ''
 let selfPane = ''
-let home = ''
-let lastWtError = ''
-const exePaths = new Map()
 let ownTab = null // { at, windowId, tabIndex, panes, isAgentPane }
 let tabStableId = ''
 let lastShellPane = ''
@@ -42,18 +37,9 @@ let failure = null // { pane, rawPane, code, summary, output, shell, cwd, dismis
 let fixPending = false
 let introSent = false
 let listening = false
-let status = 'idle'
-let statusSince = 0
-let lastReply = ''
-let handover = null // { instructions, from } while a requested handover turn runs
-let watchCfg = null
-let watchTimer = null
-let watching = false
-let proposals = [] // sessions the watcher wants to compact, in ask mode
 const lastExit = new Map()
 const doneCount = new Map()
-const acted = new Map() // session id -> context (k) when it was asked to compact
-const checked = new Map() // session id -> { reply, ok }
+const exePaths = new Map()
 
 // ---------- helpers ----------
 
@@ -84,20 +70,13 @@ function quoteArg(s) {
   return out + '\\'.repeat(slashes * 2) + '"'
 }
 
-function randomToken() {
-  const bytes = new Uint8Array(16)
-  crypto.getRandomValues(bytes)
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-}
-
-function pack(marker, obj) {
-  return `${marker} ${encodeURIComponent(JSON.stringify(obj))}`
-}
-
-function unpack(marker, text) {
-  const m = String(text ?? '').match(new RegExp(marker.replace(/[[\]]/g, '\\$&') + ' (\\S+)'))
-  if (!m) return null
-  try { return JSON.parse(decodeURIComponent(m[1])) } catch { return null }
+// One key name (Up, C-c, F5) or plain text, as the bytes to send.
+function keyBytes(key) {
+  const named = KEYS[key.toLowerCase()]
+  if (named) return named
+  const ctrl = key.match(/^C-(.)$/i)
+  if (ctrl) return String.fromCharCode(ctrl[1].toUpperCase().charCodeAt(0) & 0x1f)
+  return key
 }
 
 // Programs started inside an app package (such as the agent pane) can't use the shared
@@ -125,14 +104,12 @@ async function exe($, name) {
   for (const candidate of candidates) {
     try {
       const r = await $.process.run([candidate, '--help'], { timeoutMs: 5000 })
-      if (r.exitCode !== 0) {
-        lastWtError = `${candidate} --help: exit ${r.exitCode} ${(r.stderr || r.stdout).trim().slice(0, 200)}`
-        continue
+      if (r.exitCode === 0) {
+        exePaths.set(name, candidate)
+        return candidate
       }
-      exePaths.set(name, candidate)
-      return candidate
-    } catch (err) {
-      lastWtError = `${candidate}: ${String(err?.message ?? err).slice(0, 200)}`
+    } catch {
+      // Not there; try the next one.
     }
   }
   exePaths.set(name, name)
@@ -142,19 +119,19 @@ async function exe($, name) {
 async function wt($, args, stdin) {
   try {
     const r = await $.process.run([await exe($, WTCLI), '--json', ...args], stdin ? { stdin, timeoutMs: 10000 } : { timeoutMs: 10000 })
-    if (r.exitCode !== 0) {
-      lastWtError = `${args[0]} (${exePaths.get(WTCLI)}): ${(r.stderr || r.stdout || 'wtcli failed').trim()}`
-      return { error: lastWtError }
-    }
-    lastWtError = ''
+    if (r.exitCode !== 0) return { error: `${args[0]}: ${(r.stderr || r.stdout || 'wtcli failed').trim()}` }
     try { return JSON.parse(r.stdout) } catch { return { text: r.stdout } }
   } catch (err) {
-    lastWtError = `${args[0]}: ${String(err?.message ?? err)}`
-    return { error: lastWtError }
+    return { error: `${args[0]}: ${String(err?.message ?? err)}` }
   }
 }
 
-// ---------- the terminal ----------
+async function screenTail($, pane, lines) {
+  const r = await wt($, ['capture-pane', '-t', pane, '-l', String(lines)])
+  return r.error ? '' : String(r.content ?? '').split(/\r?\n/).filter(l => l.trim()).join('\n')
+}
+
+// ---------- this session's pane and tab ----------
 
 // Find the tab this session's pane is in. Cached for a few seconds.
 // Terminal leaves agent panes out of its pane lists, so an agent pane finds its
@@ -197,6 +174,16 @@ async function findOwnTab($, fresh) {
   return ownTab
 }
 
+// Kept so a reload of the mod finds the same tab again.
+async function remember($) {
+  if (!sessionId || !ownTab) return
+  try {
+    await $.store.set(MEMORY + sessionId, { wtPane: selfPane, tabPanes: ownTab.panes.map(p => norm(p.session_id)), isAgentPane: !!ownTab.isAgentPane, at: await $.clock.now() })
+  } catch {
+    // Only a reload needs it.
+  }
+}
+
 async function paneInOwnTab($, pane) {
   let tab = await findOwnTab($, false)
   if (tab && tab.panes.some(p => norm(p.session_id) === pane)) return true
@@ -208,8 +195,8 @@ function paneInfo(pane) {
   return ownTab?.panes.find(p => norm(p.session_id) === pane) ?? null
 }
 
-// The shell pane the user is working with: the active pane, or when that's
-// this session's own pane, the last shell pane in this tab.
+// The pane the user works in: the active pane, or when that's this session's
+// own pane, the last shell pane in this tab.
 async function sourcePane($) {
   const active = await wt($, ['active-pane'])
   if (active.session_id && norm(active.session_id) !== selfPane && !active.is_agent_pane) return active
@@ -238,10 +225,7 @@ async function terminalNote($) {
   return note
 }
 
-async function screenTail($, pane, lines) {
-  const r = await wt($, ['capture-pane', '-t', pane, '-l', String(lines)])
-  return r.error ? '' : String(r.content ?? '').split(/\r?\n/).filter(l => l.trim()).join('\n')
-}
+// ---------- failed commands ----------
 
 async function publishFixState($, params) {
   if (!ownTab?.isAgentPane || !tabStableId) return
@@ -261,10 +245,7 @@ async function failureFromPane($, pane, code) {
   await findOwnTab($, false)
   const cap = await wt($, ['capture-pane', '-t', pane, '--last-prompt', '-l', '60'])
   let output = cap.content ?? ''
-  if (!cap.has_marks) {
-    const tail = await wt($, ['capture-pane', '-t', pane, '-l', '40'])
-    output = tail.content ?? ''
-  }
+  if (!cap.has_marks) output = await screenTail($, pane, 40)
   const info = paneInfo(pane)
   const exit = code ?? lastExit.get(pane) ?? 1
   const cmd = firstLine(output).replace(/^.*?>\s*/, '') || 'The last command'
@@ -360,207 +341,6 @@ async function listen($) {
   }
 }
 
-// ---------- the sessions ----------
-
-async function findHome($) {
-  const dir = await $.env.get('CLAUDE_CONFIG_DIR')
-  if (dir) return dir
-  const user = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
-  return user ? `${user}/.claude` : ''
-}
-
-// This session's state, for the sessions tool in other sessions.
-async function publishSelf($) {
-  try {
-    sessionId = await $.session.id()
-    let c = null
-    try { c = (await $.session.usage()).context } catch { c = null }
-    await $.store.set(FLEET + sessionId, {
-      k: c && typeof c.tokens === 'number' ? Math.round(c.tokens / 1000) : null,
-      w: c && c.window ? Math.round(c.window / 1000) : null,
-      status,
-      since: statusSince,
-      reply: lastReply,
-      cwd: await $.session.cwd(),
-      wtPane: selfPane,
-      tabPanes: (ownTab?.panes ?? []).map(p => norm(p.session_id)),
-      isAgentPane: !!ownTab?.isAgentPane,
-      wtError: lastWtError,
-      at: await $.clock.now(),
-    })
-  } catch {
-    // The store is for other sessions; this session works without it.
-  }
-}
-
-async function controlToken($, create) {
-  let token = null
-  try { token = await $.store.get('control:token') } catch { token = null }
-  if (!token && create) {
-    token = randomToken()
-    try { await $.store.set('control:token', token) } catch { /* the next send tries again */ }
-  }
-  return token
-}
-
-// Every live session (Claude Code's own register), with what it shared.
-async function liveSessions($) {
-  if (!home) return []
-  let entries = []
-  try { entries = await $.fs.list(`${home}/sessions`) } catch { return [] }
-  const now = await $.clock.now()
-  const rows = []
-  for (const f of entries) {
-    if (f.kind !== 'file' || !f.name.endsWith('.json')) continue
-    let reg
-    try { reg = JSON.parse(await $.fs.read(`${home}/sessions/${f.name}`)) } catch { continue }
-    if (!reg || typeof reg.sessionId !== 'string') continue
-    let rec = null
-    try { rec = await $.store.get(FLEET + reg.sessionId) } catch { rec = null }
-    const fresh = !!rec && now - rec.at < FRESH_MS
-    const statusAt = reg.statusUpdatedAt || rec?.since || 0
-    rows.push({
-      id: reg.sessionId,
-      name: reg.name || reg.sessionId.slice(0, 8),
-      status: reg.status || rec?.status || '',
-      idleMin: reg.status === 'idle' && statusAt ? Math.round((now - statusAt) / 60000) : 0,
-      cwd: reg.cwd || rec?.cwd || '',
-      kind: reg.kind || '',
-      rec: fresh ? rec : null,
-    })
-  }
-  rows.sort((a, b) => (b.rec?.k ?? -1) - (a.rec?.k ?? -1))
-  return rows
-}
-
-function sessionLine(s, me) {
-  const ctx = s.rec?.k != null ? `${s.rec.k}k of ${s.rec.w}k` : 'context unknown'
-  const state = s.status === 'idle' ? `idle ${s.idleMin} min` : s.status
-  const where = s.rec?.wtPane ? `terminal pane ${s.rec.wtPane}` : ''
-  const mod = s.rec ? '' : ', no terminal mod'
-  const last = s.rec?.reply ? `\n    last: ${clip(s.rec.reply.replace(/\s+/g, ' '), 200)}` : ''
-  return `${s.name}${s.id === me ? ' (you)' : ''} [${s.id}]: ${state}, ${ctx}, ${s.cwd}${where ? ', ' + where : ''}${mod}${last}`
-}
-
-async function findSession($, query) {
-  const q = String(query ?? '').trim().toLowerCase()
-  if (!q) return null
-  const all = await liveSessions($)
-  return all.find(s => s.id.toLowerCase() === q) ?? all.find(s => s.name.toLowerCase() === q) ?? all.find(s => s.id.toLowerCase().startsWith(q)) ?? null
-}
-
-async function askToCompact($, s, opts) {
-  if (!s.rec) return `${s.name} doesn't run the terminal mod, so it can't be asked. Type /compact into its pane instead with the type tool.`
-  const token = await controlToken($, true)
-  const msg = { op: 'compact', token, from: sessionId, handover: opts.handover !== false, handoverPrompt: opts.handover_prompt || '', instructions: opts.instructions || COMPACT }
-  const sent = await $.session.send({ to: { sessionId: s.id }, text: pack(CONTROL, msg) })
-  if (!sent.isDelivered) return `Couldn't reach ${s.name}: ${sent.reason}`
-  acted.set(s.id, s.rec.k ?? 0)
-  return `Asked ${s.name} to ${msg.handover ? 'write its handover, then ' : ''}run /compact.`
-}
-
-// Runs in the session that was asked: the handover turn, then /compact.
-async function handleControl($, msg) {
-  if (msg.op !== 'compact') return
-  const instructions = String(msg.instructions ?? '')
-  if (msg.handover) {
-    handover = { instructions, from: msg.from }
-    const r = await $.prompt.submit({ text: msg.handoverPrompt || HANDOVER })
-    if (r?.drop) {
-      handover = null
-      report($, msg.from, `didn't start its handover: ${r.drop}`)
-    }
-    return
-  }
-  await runCompact($, instructions, msg.from)
-}
-
-async function runCompact($, instructions, from) {
-  try {
-    await $.command.run({ command: 'compact', args: instructions })
-    report($, from, 'wrote its handover and compacted')
-  } catch (err) {
-    report($, from, `couldn't compact: ${String(err?.message ?? err)}`)
-  }
-}
-
-async function report($, to, text) {
-  if (!to) return
-  try {
-    const token = await controlToken($, false)
-    await $.session.send({ to: { sessionId: to }, text: pack(RESULT, { token, from: sessionId, text }) })
-  } catch {
-    // The sender sees the drop in context anyway.
-  }
-}
-
-// ---------- the watcher ----------
-
-async function atCheckpoint($, s) {
-  const reply = s.rec?.reply ?? ''
-  if (!reply) return false
-  const known = checked.get(s.id)
-  if (known && known.reply === reply) return known.ok
-  let ok = false
-  try {
-    const r = await $.model.complete({ model: 'haiku', system: CHECKPOINT, prompt: reply, maxTokens: 5, timeoutMs: 20000 })
-    ok = r.isAnswered && /^\s*yes/i.test(r.text)
-  } catch {
-    ok = false
-  }
-  checked.set(s.id, { reply, ok })
-  return ok
-}
-
-async function watchTick($) {
-  if (!watchCfg?.enabled || watching) return
-  watching = true
-  try {
-    const now = await $.clock.now()
-    const owner = await $.store.get('watch:owner')
-    if (owner && owner.id !== sessionId && now - owner.at < 2 * 60000) return
-    await $.store.set('watch:owner', { id: sessionId, at: now })
-    for (const s of await liveSessions($)) {
-      if (s.id === sessionId || !s.rec || s.status !== 'idle') continue
-      if (s.idleMin < watchCfg.min_idle_minutes || (s.rec.k ?? 0) < watchCfg.min_context_k) continue
-      const before = acted.get(s.id)
-      if (before !== undefined && s.rec.k > before - 50) continue
-      if (proposals.some(p => p.id === s.id)) continue
-      if (watchCfg.checkpoint_check && !(await atCheckpoint($, s))) continue
-      if (watchCfg.mode === 'auto') {
-        $.ui.log(`terminal: ${await askToCompact($, s, watchCfg)} (${s.rec.k}k, idle ${s.idleMin} min)`)
-      } else {
-        acted.set(s.id, s.rec.k ?? 0)
-        proposals.push({ id: s.id, name: s.name, k: s.rec.k, idleMin: s.idleMin })
-        $.ui.invalidate('ui.render')
-      }
-    }
-  } catch {
-    // Try again next round.
-  } finally {
-    watching = false
-  }
-}
-
-function startWatcher($) {
-  if (watchTimer) watchTimer.cancel()
-  watchTimer = watchCfg?.enabled ? $.clock.every(30000, () => watchTick($)) : null
-}
-
-async function acceptProposal($, p, yes) {
-  proposals = proposals.filter(x => x.id !== p.id)
-  $.ui.invalidate('ui.render')
-  if (!yes) return
-  const s = await findSession($, p.id)
-  if (s) $.ui.log(`terminal: ${await askToCompact($, s, watchCfg ?? {})}`)
-}
-
-function watchSummary() {
-  if (!watchCfg?.enabled) return 'The session watcher is off.'
-  const c = watchCfg
-  return `Watching every session: at ${c.min_context_k}k context or more, idle ${c.min_idle_minutes} min or more${c.checkpoint_check ? ', at a good checkpoint' : ''}, I ${c.mode === 'auto' ? 'ask it' : 'offer'} to ${c.handover ? 'write its handover and ' : ''}run /compact.`
-}
-
 // ---------- tools ----------
 
 async function toolPanes($) {
@@ -621,7 +401,7 @@ async function toolRun($, e) {
   for (let waited = 0; waited < 7000 && (doneCount.get(pane) ?? 0) === before; waited += 350) {
     await $.clock.sleep(350)
   }
-  if ((doneCount.get(pane) ?? 0) === before) return `Sent to pane ${pane}. It's still running, or the pane has no shell integration. Use read to check on it.`
+  if ((doneCount.get(pane) ?? 0) === before) return `Sent to pane ${pane}. It's still running, or the pane has no shell integration. Its screen now:\n${clip(await screenTail($, pane, 15), 1500)}`
   const last = await wt($, ['capture-pane', '-t', pane, '--last-prompt', '-l', '80'])
   return `Finished with exit code ${lastExit.get(pane)}.\n${clip(last.content ?? '', 6000)}`
 }
@@ -657,8 +437,11 @@ async function toolKeys($, e) {
   if (pane === selfPane) return "That's your own pane."
   const keys = (Array.isArray(e.keys) ? e.keys : [e.keys]).map(String).filter(k => k)
   if (!keys.length) return 'No keys given.'
-  const r = await wt($, ['send-keys', '-t', pane, '--', ...keys])
-  if (r.error) return r.error
+  // One key at a time, so a program reads Escape and an arrow as two keys.
+  for (const key of keys) {
+    const r = await wt($, ['send-keys', '-t', pane, '--raw', '--', keyBytes(key)])
+    if (r.error) return r.error
+  }
   await $.clock.sleep(800)
   return `Sent. Its screen now:\n${clip(await screenTail($, pane, 15), 1500)}`
 }
@@ -701,46 +484,15 @@ async function toolResolve($, e) {
   }
 }
 
-async function toolSessions($) {
-  const rows = await liveSessions($)
-  if (!rows.length) return 'No sessions found.'
-  return rows.map(s => sessionLine(s, sessionId)).join('\n')
-}
-
-async function toolCompact($, e) {
-  const s = await findSession($, e.session)
-  if (!s) return `No live session called ${e.session}.`
-  if (s.id === sessionId) return "That's you. Run /compact yourself."
-  return askToCompact($, s, e)
-}
-
-async function toolWatch($, e) {
-  const base = watchCfg ?? WATCH_DEFAULTS
-  const next = { ...WATCH_DEFAULTS, ...base }
-  for (const key of Object.keys(WATCH_DEFAULTS)) {
-    if (e[key] !== undefined) next[key] = e[key]
-  }
-  watchCfg = next
-  try { await $.store.set('watch:config', next) } catch { /* kept for this session */ }
-  if (next.enabled) {
-    try { await $.store.set('watch:owner', { id: sessionId, at: await $.clock.now() }) } catch { /* next round */ }
-  }
-  startWatcher($)
-  return watchSummary()
-}
-
 async function runTool($, name, e) {
   if (name === 'panes') return toolPanes($)
   if (name === 'read') return toolRead($, e)
   if (name === 'run') return toolRun($, e)
-  if (name === 'keys') return toolKeys($, e)
   if (name === 'type') return toolType($, e)
+  if (name === 'keys') return toolKeys($, e)
   if (name === 'open') return toolOpen($, e)
   if (name === 'delegate') return toolDelegate($, e)
   if (name === 'resolve_command') return toolResolve($, e)
-  if (name === 'sessions') return toolSessions($)
-  if (name === 'compact_session') return toolCompact($, e)
-  if (name === 'watch') return toolWatch($, e)
   if (name === 'profiles') {
     const r = await wt($, ['list-profiles'])
     return r.error ?? JSON.stringify(r.profiles ?? r, null, 1)
@@ -756,23 +508,20 @@ async function runTool($, name, e) {
 }
 
 async function registerTools($) {
-  const pane = { type: 'string', description: 'Pane id from panes. Leave out to use the pane the user is working in.' }
+  const pane = { type: 'string', description: 'Pane id from panes. Leave out to use the pane the user works in.' }
   const direction = { type: 'string', enum: ['right', 'left', 'up', 'down', 'auto'] }
   const tools = [
     { name: 'panes', description: 'List Windows Terminal windows, tabs and panes with shell, folder, title, last exit code and the agent CLI running in the pane (agent, for example "claude"). Your own pane is marked "you".', inputSchema: { type: 'object', properties: {} } },
-    { name: 'type', description: 'Type text into the input of one or more terminal panes, then press Enter, as if the user typed it, and returns what each pane shows afterwards. For example a slash command into every pane running Claude Code (find them with panes). Read a pane first to see what it shows now: in a Claude Code pane that is busy, text is queued, and an open dialog takes the keys. A newline in the text also presses Enter.', inputSchema: { type: 'object', properties: { panes: { type: 'array', items: { type: 'string' }, description: 'Pane ids from panes.' }, text: { type: 'string' }, enter: { type: 'boolean', description: 'Press Enter after the text. Default true.' } }, required: ['panes', 'text'] } },
     { name: 'read', description: "Read a terminal pane's screen, or just its last command and output.", inputSchema: { type: 'object', properties: { pane, lines: { type: 'integer', description: 'How many lines, up to 400. Default 60.' }, last_command: { type: 'boolean', description: 'Only the last command and its output (needs shell integration).' } } } },
-    { name: 'run', description: "Type a command into one of the user's terminal panes and press Enter. The user approves it first. By default waits a few seconds and returns the output.", inputSchema: { type: 'object', properties: { command: { type: 'string', description: "The command, in that pane's shell syntax." }, pane, wait: { type: 'boolean', description: 'Wait for the result. Default true.' } }, required: ['command'] } },
-    { name: 'keys', description: 'Send key presses to a terminal pane and return what it shows afterwards. Read the pane first: Escape closes a dialog, but in a Claude Code pane that is working it stops the turn. Names: Enter, Tab, Escape, BSpace, C-c and other C-<key>. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
-    { name: 'open', description: 'Open a new terminal tab or split, optionally running a command, in a folder (tabs only) or with a profile.', inputSchema: { type: 'object', properties: { where: { type: 'string', enum: ['tab', 'split'] }, command: { type: 'string' }, cwd: { type: 'string', description: 'Starting folder, for tabs.' }, profile: { type: 'string', description: 'Profile name or GUID from profiles.' }, direction, size: { type: 'number', description: 'Split size from 0.1 to 0.9.' }, title: { type: 'string' }, pane: { type: 'string', description: 'Pane to split. Default: the pane the user is working in.' } }, required: ['where'] } },
+    { name: 'run', description: "Type a command into one of the user's shell panes and press Enter. The user approves it first. By default waits a few seconds and returns the output.", inputSchema: { type: 'object', properties: { command: { type: 'string', description: "The command, in that pane's shell syntax." }, pane, wait: { type: 'boolean', description: 'Wait for the result. Default true.' } }, required: ['command'] } },
+    { name: 'type', description: 'Type text into the input of one or more terminal panes, then press Enter, as if the user typed it, and return what each pane shows afterwards. For example a slash command into every pane running Claude Code (find them with panes). Read a pane first: in a busy Claude Code pane text is queued, and an open dialog takes the keys. A newline in the text also presses Enter.', inputSchema: { type: 'object', properties: { panes: { type: 'array', items: { type: 'string' }, description: 'Pane ids from panes.' }, text: { type: 'string' }, enter: { type: 'boolean', description: 'Press Enter after the text. Default true.' } }, required: ['panes', 'text'] } },
+    { name: 'keys', description: 'Send key presses to a terminal pane and return what it shows afterwards. Read the pane first: Escape closes a dialog, but in a Claude Code pane that is working it stops the turn. Names: Enter, Tab, S-Tab, Escape, BSpace, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Delete, F1 to F12, and C-<key> such as C-c. Other strings are typed as text.', inputSchema: { type: 'object', properties: { pane: { type: 'string', description: 'Pane id from panes.' }, keys: { type: 'array', items: { type: 'string' } } }, required: ['pane', 'keys'] } },
+    { name: 'open', description: 'Open a new terminal tab or split, optionally running a command, in a folder (tabs only) or with a profile.', inputSchema: { type: 'object', properties: { where: { type: 'string', enum: ['tab', 'split'] }, command: { type: 'string' }, cwd: { type: 'string', description: 'Starting folder, for tabs.' }, profile: { type: 'string', description: 'Profile name or GUID from profiles.' }, direction, size: { type: 'number', description: 'Split size from 0.1 to 0.9.' }, title: { type: 'string' }, pane: { type: 'string', description: 'Pane to split. Default: the pane the user works in.' } }, required: ['where'] } },
     { name: 'delegate', description: 'Start another Claude Code session in a new tab or split with a task. Give it everything it needs: goal, context, folder and when it is done.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, where: { type: 'string', enum: ['tab', 'split'] }, cwd: { type: 'string' }, direction, title: { type: 'string' } }, required: ['task'] } },
     { name: 'profiles', description: 'List the terminal profiles (id, name, default, agent).', inputSchema: { type: 'object', properties: {} } },
     { name: 'resolve_command', description: 'Find what a command name resolves to for a folder and shell, with close matches when it is not found.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, cwd: { type: 'string' }, shell: { type: 'string', description: 'For example pwsh.exe, powershell.exe, cmd.exe, bash.' } }, required: ['name'] } },
     { name: 'focus', description: 'Move focus to a terminal pane.', inputSchema: { type: 'object', properties: { pane }, required: ['pane'] } },
     { name: 'close', description: 'Close a terminal pane.', inputSchema: { type: 'object', properties: { pane }, required: ['pane'] } },
-    { name: 'sessions', description: 'List every live Claude Code session on this machine: name, id, busy or idle and for how long, context size, folder, where it runs, and the end of its last reply.', inputSchema: { type: 'object', properties: {} } },
-    { name: 'compact_session', description: 'Ask another session to write its handover and then run /compact. It runs them itself, as if typed.', inputSchema: { type: 'object', properties: { session: { type: 'string', description: 'Name or id from sessions.' }, handover: { type: 'boolean', description: 'Write a handover first. Default true.' }, handover_prompt: { type: 'string', description: 'What to ask for in the handover, if not the default.' }, instructions: { type: 'string', description: 'What /compact should keep, if not the default.' } }, required: ['session'] } },
-    { name: 'watch', description: 'Keep an eye on every session in the background, without using your turns. When one is idle, past a context size, and stopped at a good checkpoint, ask it (mode auto) or offer the user (mode ask) to write its handover and /compact. Call with only the fields to change.', inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, mode: { type: 'string', enum: ['ask', 'auto'] }, min_context_k: { type: 'number', description: 'Context size in thousands of tokens. Default 400.' }, min_idle_minutes: { type: 'number', description: 'Default 3.' }, handover: { type: 'boolean', description: 'Handover before /compact. Default true.' }, handover_prompt: { type: 'string' }, instructions: { type: 'string', description: 'What /compact should keep.' }, checkpoint_check: { type: 'boolean', description: 'Only at a good checkpoint, judged from the last reply. Default true.' } } } },
   ]
   for (const tool of tools) {
     try { await $.tool.register({ ...tool, isDeferred: false }) } catch { /* already registered */ }
@@ -783,28 +532,19 @@ async function registerTools($) {
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
-    home = await findHome($)
     selfPane = norm(await $.env.get('WT_SESSION'))
-    // After a reload, start from what this session knew about its tab.
     sessionId = await $.session.id()
+    // After a reload, start from what this session knew about its tab.
     let saved = null
-    try { saved = await $.store.get(FLEET + sessionId) } catch { saved = null }
+    try { saved = await $.store.get(MEMORY + sessionId) } catch { saved = null }
     if (selfPane && saved?.wtPane === selfPane && saved.tabPanes?.length) {
       ownTab = { at: 0, windowId: 0, tabIndex: 0, panes: saved.tabPanes.map(id => ({ session_id: id })), isAgentPane: !!saved.isAgentPane }
     }
     await findOwnTab($, true)
-    statusSince = await $.clock.now()
-    await publishSelf($)
-    $.clock.every(60000, () => publishSelf($))
-
+    await remember($)
     await registerTools($)
     try { await $.command.register({ name: 'fix', description: 'Fix the last failed command in this tab', argumentHint: '[note]' }) } catch { /* taken */ }
     try { await $.command.register({ name: 'panes', description: 'Show the terminal panes', immediate: true }) } catch { /* taken */ }
-    try { await $.command.register({ name: 'sessions', description: 'Show every Claude Code session', immediate: true }) } catch { /* taken */ }
-    try { await $.command.register({ name: 'watch', description: 'Show or turn off the session watcher', argumentHint: '[off|on]', immediate: true }) } catch { /* taken */ }
-    await controlToken($, true)
-    try { watchCfg = await $.store.get('watch:config') } catch { watchCfg = null }
-    startWatcher($)
     if (selfPane && !listening) {
       listening = true
       listen($)
@@ -817,54 +557,7 @@ export function register(on) {
     return next(e)
   })
 
-  on('turn.start', async ($, e, next) => {
-    if (!e.agentId) {
-      status = 'working'
-      statusSince = await $.clock.now()
-      publishSelf($)
-    }
-    return next(e)
-  })
-
-  on('turn.complete', async ($, e, next) => {
-    const r = await next(e)
-    if (e.agentId) return r
-    status = 'idle'
-    statusSince = await $.clock.now()
-    if (typeof e.text === 'string' && e.text) lastReply = clip(e.text, 800)
-    publishSelf($)
-    if (fixPending) {
-      fixPending = false
-      publishFixState($, { state: 'cleared' })
-    }
-    if (handover) {
-      const h = handover
-      handover = null
-      // Outside this hook, so /compact can queue.
-      $.clock.after(0, () => runCompact($, h.instructions, h.from))
-    }
-    return r
-  })
-
-  // Control messages from another session running this mod, and their results.
-  on('session.receive', async ($, e, next) => {
-    if (e.agentId || e.origin?.kind !== 'peer-send-message') return next(e)
-    const control = unpack(CONTROL, e.text)
-    const result = control ? null : unpack(RESULT, e.text)
-    const msg = control ?? result
-    if (!msg) return next(e)
-    const token = await controlToken($, false)
-    if (!token || msg.token !== token) return next(e)
-    if (control) {
-      $.clock.after(0, () => handleControl($, control))
-      return { consumed: 'terminal control message' }
-    }
-    const s = (await liveSessions($)).find(x => x.id === result.from)
-    $.ui.log(`terminal: ${s?.name ?? result.from} ${result.text}`)
-    return { consumed: 'terminal result' }
-  }).catch(($, e, next) => next(e))
-
-  // Add the terminal note to each message the user sends.
+  // The intro once, then a note about the user's pane with each message they send.
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta) return next(e)
     const blocks = []
@@ -875,10 +568,20 @@ export function register(on) {
     if (selfPane && (e.origin?.kind === 'composer' || e.origin?.kind === 'bridge')) {
       const note = await terminalNote($)
       if (note) blocks.push(note)
+      remember($)
     }
     if (!blocks.length) return next(e)
     return next({ ...e, context: [...(e.context ?? []), ...blocks] })
   }).catch(($, e, next) => next(e))
+
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    if (!e.agentId && fixPending) {
+      fixPending = false
+      publishFixState($, { state: 'cleared' })
+    }
+    return r
+  })
 
   on('tool.call', async ($, e, next) => {
     const name = String(e.tool ?? '')
@@ -909,52 +612,22 @@ export function register(on) {
     return { text: await toolPanes($) }
   })
 
-  on('command.run', { command: 'sessions' }, async ($) => {
-    for (const line of (await toolSessions($)).split('\n')) $.ui.log(line)
-    return {}
-  })
-
-  on('command.run', { command: 'watch' }, async ($, e) => {
-    const arg = String(e.args ?? '').trim().toLowerCase()
-    if (arg === 'off' || arg === 'on') await toolWatch($, { enabled: arg === 'on' })
-    $.ui.log(watchSummary())
-    return {}
-  })
-
-  // Above the prompt: a failed command, and sessions the watcher wants to compact.
+  // A failed command in this tab, above the prompt.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const showFailure = failure && !failure.dismissed
-    if (!showFailure && !proposals.length) return next(e)
+    if (!failure || failure.dismissed) return next(e)
+    const f = failure
     const ui = $.ui.resolve(e)
-    const rows = []
-    if (showFailure) {
-      const f = failure
-      rows.push(ui.Box({
-        flexDirection: 'row',
-        columnGap: 2,
-        children: [
-          ui.Text({ color: 'red', wrap: 'truncate', children: ['✗ ' + f.summary] }),
-          ui.Button({ key: 'terminal-fix', label: 'Fix', hotkey: '1', plain: true, onPress: () => startFix($, f, 'fix', '') }),
-          ui.Button({ key: 'terminal-explain', label: 'Explain', hotkey: '2', plain: true, onPress: () => startFix($, f, 'explain', '') }),
-          ui.Button({ key: 'terminal-dismiss', label: 'Dismiss', hotkey: '3', plain: true, onPress: () => dismissFailure($) }),
-        ],
-      }))
-    }
-    if (proposals.length) {
-      const p = proposals[0]
-      const more = proposals.length > 1 ? ` (+${proposals.length - 1} more)` : ''
-      rows.push(ui.Box({
-        flexDirection: 'row',
-        columnGap: 2,
-        children: [
-          ui.Text({ wrap: 'truncate', children: [`${p.name} is idle at a checkpoint with ${p.k}k context${more}`] }),
-          ui.Button({ key: 'terminal-compact', label: 'Hand over + compact', hotkey: '4', plain: true, onPress: () => acceptProposal($, p, true) }),
-          ui.Button({ key: 'terminal-skip', label: 'Skip', hotkey: '5', plain: true, onPress: () => acceptProposal($, p, false) }),
-        ],
-      }))
-    }
+    const row = ui.Box({
+      flexDirection: 'row',
+      columnGap: 2,
+      children: [
+        ui.Text({ color: 'red', wrap: 'truncate', children: ['✗ ' + f.summary] }),
+        ui.Button({ key: 'terminal-fix', label: 'Fix', hotkey: '1', plain: true, onPress: () => startFix($, f, 'fix', '') }),
+        ui.Button({ key: 'terminal-explain', label: 'Explain', hotkey: '2', plain: true, onPress: () => startFix($, f, 'explain', '') }),
+        ui.Button({ key: 'terminal-dismiss', label: 'Dismiss', hotkey: '3', plain: true, onPress: () => dismissFailure($) }),
+      ],
+    })
     const rest = await next(e)
-    if (rest) rows.push(rest)
-    return rows.length === 1 ? rows[0] : ui.Box({ flexDirection: 'column', children: rows })
+    return rest ? ui.Box({ flexDirection: 'column', children: [row, rest] }) : row
   })
 }

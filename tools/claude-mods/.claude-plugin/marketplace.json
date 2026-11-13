@@ -1,0 +1,19 @@
+{
+  "name": "intelligent-terminal-mods",
+  "description": "Claude Code mods for Intelligent Terminal. Each one stands alone; add or remove any of them.",
+  "owner": {
+    "name": "albinwall"
+  },
+  "plugins": [
+    {
+      "name": "terminal",
+      "description": "Tools to see and use the terminal's panes, a note about the user's pane with each prompt, and a Fix line for failed commands",
+      "source": "./terminal"
+    },
+    {
+      "name": "sessions",
+      "description": "Every Claude Code session for every other: shared state, slash commands run on request, and a watcher that compacts at good checkpoints",
+      "source": "./sessions"
+    }
+  ]
+}
